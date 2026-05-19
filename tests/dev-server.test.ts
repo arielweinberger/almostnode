@@ -387,6 +387,23 @@ h1 {
       expect(response.body.toString()).toContain('font-family');
     });
 
+    it('should rewrite root-absolute CSS asset URLs relative to the CSS file', async () => {
+      vfs.writeFileSync(
+        '/src/asset-test.css',
+        `@import "/reset.css";
+.logo { background: url('/assets/logo.svg#mark'); }
+.external { background: url('https://example.com/bg.png'); }`
+      );
+
+      const response = await server.handleRequest('GET', '/src/asset-test.css', {});
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(body).toContain('@import "../reset.css"');
+      expect(body).toContain("url('../assets/logo.svg#mark')");
+      expect(body).toContain("url('https://example.com/bg.png')");
+    });
+
     it('should return 404 for missing files', async () => {
       const response = await server.handleRequest('GET', '/missing.html', {});
 
@@ -413,6 +430,38 @@ h1 {
 
       expect(body).toContain("const cssModuleUrl = '.' + normalizedPath + '?t=' + timestamp");
       expect(body).toContain('import(cssModuleUrl)');
+    });
+
+    it('should rewrite root-absolute HTML URLs relative to the served HTML file', async () => {
+      vfs.mkdirSync('/nested', { recursive: true });
+      vfs.writeFileSync(
+        '/nested/page.html',
+        `<!DOCTYPE html>
+<html>
+<head>
+  <link rel="stylesheet" href="/src/style.css">
+  <script type="module" src="/src/main.jsx"></script>
+</head>
+<body>
+  <img src="/assets/logo.svg" srcset="/small.png 1x, /large.png 2x">
+  <form action="/api/contact"></form>
+  <a href="https://example.com">external</a>
+  <a href="/__virtual__/3000/keep">virtual</a>
+</body>
+</html>`
+      );
+
+      const response = await server.handleRequest('GET', '/nested/page.html', {});
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(body).toContain('href="../src/style.css"');
+      expect(body).toContain('src="../src/main.jsx"');
+      expect(body).toContain('src="../assets/logo.svg"');
+      expect(body).toContain('srcset="../small.png 1x, ../large.png 2x"');
+      expect(body).toContain('action="../api/contact"');
+      expect(body).toContain('href="https://example.com"');
+      expect(body).toContain('href="/__virtual__/3000/keep"');
     });
 
     it('should inject script before </head>', async () => {
@@ -595,6 +644,30 @@ h1 {
 
       expect(response.statusCode).toBe(200);
       expect(response.headers['Content-Type']).toBe('application/javascript; charset=utf-8');
+    });
+
+    it('should rewrite root-absolute JS imports and fetches relative to the module file', async () => {
+      vfs.writeFileSync(
+        '/src/root-imports.js',
+        `import "/global.css";
+import helper from "/lib/helper.js";
+export { thing } from "/lib/thing.js";
+const lazy = () => import("/lib/lazy.js");
+fetch("/api/data.json");
+fetch("https://example.com/api");
+export default helper;`
+      );
+
+      const response = await server.handleRequest('GET', '/src/root-imports.js', {});
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(body).toContain('import "../global.css"');
+      expect(body).toContain('from "../lib/helper.js"');
+      expect(body).toContain('from "../lib/thing.js"');
+      expect(body).toContain('import("../lib/lazy.js")');
+      expect(body).toContain('fetch("../api/data.json")');
+      expect(body).toContain('fetch("https://example.com/api")');
     });
 
     it('should handle TSX files', async () => {

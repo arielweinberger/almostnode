@@ -283,6 +283,107 @@ const HMR_CLIENT_SCRIPT = `
 </script>
 `;
 
+function isLocalRootAbsoluteUrl(url: string): boolean {
+  return url.startsWith('/') &&
+    !url.startsWith('//') &&
+    !url.startsWith('/__virtual__');
+}
+
+function splitUrlSuffix(url: string): { pathname: string; suffix: string } {
+  const suffixIndex = url.search(/[?#]/);
+  if (suffixIndex === -1) {
+    return { pathname: url, suffix: '' };
+  }
+  return {
+    pathname: url.slice(0, suffixIndex),
+    suffix: url.slice(suffixIndex),
+  };
+}
+
+function dirname(path: string): string {
+  const clean = path.split('?')[0].split('#')[0];
+  const index = clean.lastIndexOf('/');
+  return index <= 0 ? '/' : clean.slice(0, index);
+}
+
+function relativeFromFile(filePath: string, targetUrl: string): string {
+  const { pathname, suffix } = splitUrlSuffix(targetUrl);
+  const fromParts = dirname(filePath).split('/').filter(Boolean);
+  const toParts = pathname.split('/').filter(Boolean);
+
+  while (fromParts.length > 0 && toParts.length > 0 && fromParts[0] === toParts[0]) {
+    fromParts.shift();
+    toParts.shift();
+  }
+
+  const prefix = fromParts.length === 0
+    ? './'
+    : '../'.repeat(fromParts.length);
+  return `${prefix}${toParts.join('/')}${suffix}`;
+}
+
+function rewriteRootAbsoluteUrl(filePath: string, url: string): string {
+  if (!isLocalRootAbsoluteUrl(url)) {
+    return url;
+  }
+  return relativeFromFile(filePath, url);
+}
+
+function rewriteHtmlRootUrls(html: string, filePath: string): string {
+  let rewritten = html.replace(
+    /\b(src|href|action|poster)\s*=\s*(["'])(\/(?!\/|__virtual__)[^"']*)\2/g,
+    (_match, attr: string, quote: string, url: string) =>
+      `${attr}=${quote}${rewriteRootAbsoluteUrl(filePath, url)}${quote}`
+  );
+
+  rewritten = rewritten.replace(
+    /\bsrcset\s*=\s*(["'])([^"']*)\1/g,
+    (_match, quote: string, srcset: string) => {
+      const nextSrcset = srcset
+        .split(',')
+        .map((candidate) => {
+          const trimmed = candidate.trim();
+          if (!trimmed) return trimmed;
+          const [url, ...descriptor] = trimmed.split(/\s+/);
+          const nextUrl = rewriteRootAbsoluteUrl(filePath, url);
+          return [nextUrl, ...descriptor].join(' ');
+        })
+        .join(', ');
+      return `srcset=${quote}${nextSrcset}${quote}`;
+    }
+  );
+
+  return rewritten;
+}
+
+function rewriteJsRootUrls(code: string, filePath: string): string {
+  return code
+    .replace(
+      /(\b(?:import|export)\s+(?:[^'"]*?\s+from\s*)?|\bimport\s*\(\s*)(["'])(\/(?!\/|__virtual__)[^"']+)\2/g,
+      (_match, prefix: string, quote: string, url: string) =>
+        `${prefix}${quote}${rewriteRootAbsoluteUrl(filePath, url)}${quote}`
+    )
+    .replace(
+      /(\bfetch\s*\(\s*)(["'])(\/(?!\/|__virtual__)[^"']+)\2/g,
+      (_match, prefix: string, quote: string, url: string) =>
+        `${prefix}${quote}${rewriteRootAbsoluteUrl(filePath, url)}${quote}`
+    );
+}
+
+function rewriteCssRootUrls(css: string, filePath: string): string {
+  return css
+    .replace(
+      /url\(\s*(["']?)(\/(?!\/|__virtual__)[^"')]+)\1\s*\)/g,
+      (_match, quote: string, url: string) =>
+        `url(${quote}${rewriteRootAbsoluteUrl(filePath, url)}${quote})`
+    )
+    .replace(
+      /(@import\s+)(["'])(\/(?!\/|__virtual__)[^"']+)\2/g,
+      (_match, prefix: string, quote: string, url: string) =>
+        `${prefix}${quote}${rewriteRootAbsoluteUrl(filePath, url)}${quote}`
+    );
+}
+
 export class ViteDevServer extends DevServer {
   private watcherCleanup: (() => void) | null = null;
   private options: ViteDevServerOptions;
@@ -355,6 +456,10 @@ export class ViteDevServer extends DevServer {
       return this.transformAndServe(filePath, pathname);
     }
 
+    if (/\.(js|mjs)$/.test(pathname)) {
+      return this.serveJsFile(filePath);
+    }
+
     // Check if CSS is being imported as a module (needs to be converted to JS)
     // In browser context with ES modules, CSS imports need to be served as JS
     if (pathname.endsWith('.css')) {
@@ -378,7 +483,7 @@ export class ViteDevServer extends DevServer {
         return this.serveCssAsModule(filePath);
       }
       // Otherwise serve as regular CSS (e.g., <link> tags with sec-fetch-dest: style)
-      return this.serveFile(filePath);
+      return this.serveCssFile(filePath);
     }
 
     // Check if it's HTML that needs HMR client injection
@@ -548,7 +653,7 @@ export class ViteDevServer extends DevServer {
   private async transformCode(code: string, filename: string): Promise<string> {
     if (!isBrowser) {
       // In test environment, just return code as-is
-      return code;
+      return rewriteJsRootUrls(code, filename);
     }
 
     // Initialize esbuild if needed
@@ -576,15 +681,36 @@ export class ViteDevServer extends DevServer {
     });
 
     // Add React Refresh registration for JSX/TSX files
+    let transformed = result.code;
     if (/\.(jsx|tsx)$/.test(filename)) {
-      return this.addReactRefresh(result.code, filename);
+      transformed = this.addReactRefresh(transformed, filename);
     }
 
-    return result.code;
+    return rewriteJsRootUrls(transformed, filename);
   }
 
   private addReactRefresh(code: string, filename: string): string {
     return _addReactRefresh(code, filename);
+  }
+
+  private serveJsFile(filePath: string): ResponseData {
+    try {
+      const code = rewriteJsRootUrls(this.vfs.readFileSync(filePath, 'utf8'), filePath);
+      const buffer = Buffer.from(code);
+
+      return {
+        statusCode: 200,
+        statusMessage: 'OK',
+        headers: {
+          'Content-Type': 'application/javascript; charset=utf-8',
+          'Content-Length': String(buffer.length),
+          'Cache-Control': 'no-cache',
+        },
+        body: buffer,
+      };
+    } catch (error) {
+      return this.serverError(error);
+    }
   }
 
   /**
@@ -593,7 +719,7 @@ export class ViteDevServer extends DevServer {
    */
   private serveCssAsModule(filePath: string): ResponseData {
     try {
-      const css = this.vfs.readFileSync(filePath, 'utf8');
+      const css = rewriteCssRootUrls(this.vfs.readFileSync(filePath, 'utf8'), filePath);
 
       // Create JavaScript that injects the CSS into the document
       const js = `
@@ -627,6 +753,26 @@ export default css;
     }
   }
 
+  private serveCssFile(filePath: string): ResponseData {
+    try {
+      const css = rewriteCssRootUrls(this.vfs.readFileSync(filePath, 'utf8'), filePath);
+      const buffer = Buffer.from(css);
+
+      return {
+        statusCode: 200,
+        statusMessage: 'OK',
+        headers: {
+          'Content-Type': 'text/css; charset=utf-8',
+          'Content-Length': String(buffer.length),
+          'Cache-Control': 'no-cache',
+        },
+        body: buffer,
+      };
+    } catch (error) {
+      return this.serverError(error);
+    }
+  }
+
   /**
    * Serve HTML file with HMR client script injected
    *
@@ -638,6 +784,7 @@ export default css;
   private serveHtmlWithHMR(filePath: string): ResponseData {
     try {
       let content = this.vfs.readFileSync(filePath, 'utf8');
+      content = rewriteHtmlRootUrls(content, filePath);
 
       // Inject a React import map if the HTML doesn't already have one.
       // This lets seed HTML omit the esm.sh boilerplate — the platform provides it.
