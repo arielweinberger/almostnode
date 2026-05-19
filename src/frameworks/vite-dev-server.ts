@@ -407,11 +407,13 @@ export class ViteDevServer extends DevServer {
       console.warn('[ViteDevServer] Could not watch /src directory:', error);
     }
 
-    // Also watch for CSS files in root
+    // Real Vite watches root-level entry files such as index.html and config-side
+    // imports. Mirror that behavior for the file types this dev server can serve.
     try {
       const rootWatcher = this.vfs.watch(this.root, { recursive: false }, (eventType, filename) => {
-        if (eventType === 'change' && filename && filename.endsWith('.css')) {
-          this.handleFileChange(`${this.root}/${filename}`);
+        if (eventType === 'change' && filename && /\.(css|html|jsx?|tsx?)$/.test(filename)) {
+          const fullPath = this.root === '/' ? `/${filename}` : `${this.root}/${filename}`;
+          this.handleFileChange(fullPath);
         }
       });
 

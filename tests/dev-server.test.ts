@@ -737,6 +737,40 @@ export default App;`
       const update = listener.mock.calls[0][0];
       expect(update.type).toBe('update');
     });
+
+    it('should watch Vite root-level entry file types', async () => {
+      const listener = vi.fn();
+      server.on('hmr-update', listener);
+
+      vfs.writeFileSync('/root.css', 'body { color: blue; }');
+      vfs.writeFileSync('/root.js', 'export const value = 1;');
+      vfs.writeFileSync('/root.jsx', 'export default function Root() { return null; }');
+      vfs.writeFileSync('/root.ts', 'export const value: number = 1;');
+      vfs.writeFileSync('/root.tsx', 'export default function Root() { return null; }');
+
+      server.start();
+
+      vfs.writeFileSync('/index.html', '<html><body>Updated</body></html>');
+      vfs.writeFileSync('/root.css', 'body { color: red; }');
+      vfs.writeFileSync('/root.js', 'export const value = 2;');
+      vfs.writeFileSync('/root.jsx', 'export default function Root() { return <div />; }');
+      vfs.writeFileSync('/root.ts', 'export const value: number = 2;');
+      vfs.writeFileSync('/root.tsx', 'export default function Root() { return <div />; }');
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const updates = listener.mock.calls.map((call) => call[0]);
+      expect(updates.map((update) => update.path)).toEqual([
+        '/index.html',
+        '/root.css',
+        '/root.js',
+        '/root.jsx',
+        '/root.ts',
+        '/root.tsx',
+      ]);
+      expect(updates[0].type).toBe('full-reload');
+      expect(updates.slice(1).every((update) => update.type === 'update')).toBe(true);
+    });
   });
 
   describe('server lifecycle', () => {
