@@ -196,11 +196,14 @@ const HMR_CLIENT_SCRIPT = `
       console.log('[HMR] Update:', path);
 
       if (path.endsWith('.css')) {
+        const normalizedPath = path.startsWith('/') ? path : '/' + path;
+        const cssModuleUrl = '.' + normalizedPath + '?t=' + timestamp;
+
         // CSS hot reload - update stylesheet href
         const links = document.querySelectorAll('link[rel="stylesheet"]');
         links.forEach(link => {
           const href = link.getAttribute('href');
-          if (href && href.includes(path.replace(/^\\//, ''))) {
+          if (href && href.includes(normalizedPath.replace(/^\\//, ''))) {
             link.href = href.split('?')[0] + '?t=' + timestamp;
           }
         });
@@ -209,9 +212,11 @@ const HMR_CLIENT_SCRIPT = `
         const styles = document.querySelectorAll('style[data-vite-dev-id]');
         styles.forEach(style => {
           const id = style.getAttribute('data-vite-dev-id');
-          if (id && id.includes(path.replace(/^\\//, ''))) {
+          if (id && id.includes(normalizedPath.replace(/^\\//, ''))) {
             // Re-import the CSS module to get updated styles
-            import(path + '?t=' + timestamp).catch(() => {});
+            import(cssModuleUrl).catch((error) => {
+              console.error('[HMR] Failed to update CSS:', error);
+            });
           }
         });
       } else if (path.match(/\\.(jsx?|tsx?)$/)) {
@@ -593,11 +598,16 @@ export class ViteDevServer extends DevServer {
       // Create JavaScript that injects the CSS into the document
       const js = `
 // CSS Module: ${filePath}
+const id = ${JSON.stringify(filePath)};
 const css = ${JSON.stringify(css)};
-const style = document.createElement('style');
-style.setAttribute('data-vite-dev-id', ${JSON.stringify(filePath)});
+let style = Array.from(document.querySelectorAll('style[data-vite-dev-id]'))
+  .find((node) => node.getAttribute('data-vite-dev-id') === id);
+if (!style) {
+  style = document.createElement('style');
+  style.setAttribute('data-vite-dev-id', id);
+  document.head.appendChild(style);
+}
 style.textContent = css;
-document.head.appendChild(style);
 export default css;
 `;
 

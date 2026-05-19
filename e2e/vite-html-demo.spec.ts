@@ -7,6 +7,8 @@ test.describe('Vite HTML Demo', () => {
     await expect(page.locator('.demo-topbar .title')).toContainText('Vite HTML');
     await expect(page.locator('#status-text')).toContainText('Ready', { timeout: 10000 });
     await expect(page.locator('#editor')).toHaveValue(/Hello from index\.html/);
+    await expect(page.locator('.file-tab[data-file="/src/main.js"]')).toBeVisible();
+    await expect(page.locator('.file-tab[data-file="/src/style.css"]')).toBeVisible();
 
     await page.click('#run-btn');
     await expect(page.locator('#status-text')).toContainText('Dev server running', { timeout: 30000 });

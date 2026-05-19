@@ -407,6 +407,14 @@ h1 {
       expect(body).toContain('postMessage');
     });
 
+    it('should re-import CSS updates through the virtual server URL', async () => {
+      const response = await server.handleRequest('GET', '/', {});
+      const body = response.body.toString();
+
+      expect(body).toContain("const cssModuleUrl = '.' + normalizedPath + '?t=' + timestamp");
+      expect(body).toContain('import(cssModuleUrl)');
+    });
+
     it('should inject script before </head>', async () => {
       const response = await server.handleRequest('GET', '/', {});
       const body = response.body.toString();
@@ -602,6 +610,22 @@ export default Button;`
 
       expect(response.statusCode).toBe(200);
       expect(response.headers['Content-Type']).toBe('application/javascript; charset=utf-8');
+    });
+  });
+
+  describe('CSS modules', () => {
+    it('should update an existing injected style tag when CSS is re-imported', async () => {
+      const response = await server.handleRequest('GET', '/src/style.css', {
+        'sec-fetch-dest': 'script',
+      });
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['Content-Type']).toBe('application/javascript; charset=utf-8');
+      expect(body).toContain('const id = "/src/style.css";');
+      expect(body).toContain("node.getAttribute('data-vite-dev-id') === id");
+      expect(body).toContain('style.textContent = css');
+      expect(body).toContain('document.head.appendChild(style)');
     });
   });
 
