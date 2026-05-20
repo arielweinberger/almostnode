@@ -8,7 +8,7 @@ import { VirtualFS } from '../virtual-fs';
 import { Buffer } from '../shims/stream';
 import { simpleHash } from '../utils/hash';
 import { addReactRefresh as _addReactRefresh } from './code-transforms';
-import { ESBUILD_WASM_ESM_CDN, ESBUILD_WASM_BINARY_CDN, REACT_REFRESH_CDN, REACT_CDN, REACT_DOM_CDN } from '../config/cdn';
+import { ESBUILD_WASM_ESM_CDN, ESBUILD_WASM_BINARY_CDN, REACT_REFRESH_CDN, REACT_CDN, REACT_DOM_CDN, TAILWIND_CDN_URL } from '../config/cdn';
 
 // Check if we're in a real browser environment (not jsdom or Node.js)
 // jsdom has window but doesn't have ServiceWorker or SharedArrayBuffer
@@ -384,11 +384,16 @@ function rewriteCssRootUrls(css: string, filePath: string): string {
     );
 }
 
+function stripTailwindCssImport(css: string): string {
+  return css.replace(/@import\s+["']tailwindcss["']\s*;?/g, '');
+}
+
 export class ViteDevServer extends DevServer {
   private watcherCleanup: (() => void) | null = null;
   private options: ViteDevServerOptions;
   private hmrTargetWindow: Window | null = null;
   private transformCache: Map<string, { code: string; hash: string }> = new Map();
+  private tailwindPluginDetected: boolean | null = null;
 
   constructor(vfs: VirtualFS, options: ViteDevServerOptions) {
     super(vfs, options);
@@ -541,6 +546,10 @@ export class ViteDevServer extends DevServer {
    * Handle file change event
    */
   private handleFileChange(path: string): void {
+    if (/\/vite\.config\.(js|mjs|ts)$/.test(path)) {
+      this.tailwindPluginDetected = null;
+    }
+
     // Determine update type:
     // - CSS and JS/JSX/TSX files: 'update' (handled by HMR client)
     // - Other files: 'full-reload'
@@ -577,6 +586,7 @@ export class ViteDevServer extends DevServer {
     }
 
     this.hmrTargetWindow = null;
+    this.tailwindPluginDetected = null;
 
     super.stop();
   }
@@ -719,7 +729,7 @@ export class ViteDevServer extends DevServer {
    */
   private serveCssAsModule(filePath: string): ResponseData {
     try {
-      const css = rewriteCssRootUrls(this.vfs.readFileSync(filePath, 'utf8'), filePath);
+      const css = this.processCss(this.vfs.readFileSync(filePath, 'utf8'), filePath);
 
       // Create JavaScript that injects the CSS into the document
       const js = `
@@ -755,7 +765,7 @@ export default css;
 
   private serveCssFile(filePath: string): ResponseData {
     try {
-      const css = rewriteCssRootUrls(this.vfs.readFileSync(filePath, 'utf8'), filePath);
+      const css = this.processCss(this.vfs.readFileSync(filePath, 'utf8'), filePath);
       const buffer = Buffer.from(css);
 
       return {
@@ -773,6 +783,34 @@ export default css;
     }
   }
 
+  private processCss(css: string, filePath: string): string {
+    const withoutTailwindImport = this.usesTailwindVitePlugin()
+      ? stripTailwindCssImport(css)
+      : css;
+    return rewriteCssRootUrls(withoutTailwindImport, filePath);
+  }
+
+  private usesTailwindVitePlugin(): boolean {
+    if (this.tailwindPluginDetected !== null) {
+      return this.tailwindPluginDetected;
+    }
+
+    const configNames = ['vite.config.ts', 'vite.config.js', 'vite.config.mjs'];
+    this.tailwindPluginDetected = configNames.some((name) => {
+      const configPath = this.root === '/' ? `/${name}` : `${this.root}/${name}`;
+      if (!this.exists(configPath)) return false;
+
+      try {
+        const content = this.vfs.readFileSync(configPath, 'utf8');
+        return content.includes('@tailwindcss/vite') || /\btailwindcss\s*\(/.test(content);
+      } catch {
+        return false;
+      }
+    });
+
+    return this.tailwindPluginDetected;
+  }
+
   /**
    * Serve HTML file with HMR client script injected
    *
@@ -785,6 +823,7 @@ export default css;
     try {
       let content = this.vfs.readFileSync(filePath, 'utf8');
       content = rewriteHtmlRootUrls(content, filePath);
+      content = this.injectTailwindIfNeeded(content);
 
       // Inject a React import map if the HTML doesn't already have one.
       // This lets seed HTML omit the esm.sh boilerplate — the platform provides it.
@@ -853,6 +892,21 @@ export default css;
     } catch (error) {
       return this.serverError(error);
     }
+  }
+
+  private injectTailwindIfNeeded(content: string): string {
+    if (!this.usesTailwindVitePlugin() || content.includes(TAILWIND_CDN_URL)) {
+      return content;
+    }
+
+    const script = `<script src="${TAILWIND_CDN_URL}"></script>`;
+    if (content.includes('</head>')) {
+      return content.replace('</head>', `${script}\n</head>`);
+    }
+    if (content.includes('<head>')) {
+      return content.replace('<head>', `<head>\n${script}`);
+    }
+    return `${script}\n${content}`;
   }
 }
 

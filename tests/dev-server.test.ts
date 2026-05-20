@@ -404,6 +404,31 @@ h1 {
       expect(body).toContain("url('https://example.com/bg.png')");
     });
 
+    it('should strip Tailwind CSS import when the Vite Tailwind plugin is configured', async () => {
+      vfs.writeFileSync(
+        '/vite.config.ts',
+        `import { defineConfig } from 'vite';
+import tailwindcss from '@tailwindcss/vite';
+
+export default defineConfig({
+  plugins: [tailwindcss()],
+});`
+      );
+      vfs.writeFileSync(
+        '/src/tailwind.css',
+        `@import "tailwindcss";
+
+.card { background: url('/assets/card.svg'); }`
+      );
+
+      const response = await server.handleRequest('GET', '/src/tailwind.css', {});
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(body).not.toContain('@import "tailwindcss"');
+      expect(body).toContain("url('../assets/card.svg')");
+    });
+
     it('should return 404 for missing files', async () => {
       const response = await server.handleRequest('GET', '/missing.html', {});
 
@@ -462,6 +487,25 @@ h1 {
       expect(body).toContain('action="../api/contact"');
       expect(body).toContain('href="https://example.com"');
       expect(body).toContain('href="/__virtual__/3000/keep"');
+    });
+
+    it('should inject Tailwind runtime when the Vite Tailwind plugin is configured', async () => {
+      vfs.writeFileSync(
+        '/vite.config.ts',
+        `import { defineConfig } from 'vite';
+import tailwindcss from '@tailwindcss/vite';
+
+export default defineConfig({
+  plugins: [tailwindcss()],
+});`
+      );
+
+      const response = await server.handleRequest('GET', '/', {});
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(body).toContain('cdn.tailwindcss.com');
+      expect((body.match(/cdn\.tailwindcss\.com/g) || []).length).toBe(1);
     });
 
     it('should inject script before </head>', async () => {
