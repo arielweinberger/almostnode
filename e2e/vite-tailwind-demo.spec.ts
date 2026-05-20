@@ -20,9 +20,13 @@ test.describe('Vite Tailwind Demo', () => {
     expect(frame).toBeTruthy();
 
     await expect(frame!.locator('#headline')).toContainText('Vite + Tailwind in the browser', { timeout: 10000 });
+    await expect.poll(
+      () => frame!.locator('body').evaluate((element) => getComputedStyle(element).backgroundColor),
+      { timeout: 10000 }
+    ).toBe('oklch(0.129 0.042 264.695)');
   });
 
-  test('should serve Tailwind runtime and strip Tailwind CSS import', async ({ page }) => {
+  test('should serve compiled Tailwind CSS without CDN injection', async ({ page }) => {
     await page.goto('/examples/vite-tailwind-demo.html');
     await expect(page.locator('#status-text')).toContainText('Ready', { timeout: 10000 });
 
@@ -36,7 +40,7 @@ test.describe('Vite Tailwind Demo', () => {
     });
 
     expect(htmlResult.ok).toBe(true);
-    expect(htmlResult.text).toContain('cdn.tailwindcss.com');
+    expect(htmlResult.text).not.toContain('cdn.tailwindcss.com');
     expect(htmlResult.text).toContain('href="./src/style.css"');
 
     const cssResult = await page.evaluate(async () => {
@@ -46,7 +50,9 @@ test.describe('Vite Tailwind Demo', () => {
     });
 
     expect(cssResult.ok).toBe(true);
+    expect(cssResult.text).toContain('tailwindcss v4');
     expect(cssResult.text).not.toContain('@import "tailwindcss"');
+    expect(cssResult.text).toContain('.bg-slate-950');
     expect(cssResult.text).toContain('color-scheme: dark');
   });
 });

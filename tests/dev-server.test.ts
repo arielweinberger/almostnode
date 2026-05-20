@@ -303,6 +303,44 @@ describe('ViteDevServer', () => {
   let vfs: VirtualFS;
   let server: ViteDevServer;
 
+  function installFakeTailwindVitePlugin() {
+    vfs.mkdirSync('/node_modules/@tailwindcss/vite', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/@tailwindcss/vite/package.json',
+      JSON.stringify({
+        name: '@tailwindcss/vite',
+        version: '4.0.0-test',
+        main: './index.js',
+      })
+    );
+    vfs.writeFileSync(
+      '/node_modules/@tailwindcss/vite/index.js',
+      `module.exports = function tailwindcss() {
+  return {
+    name: '@tailwindcss/vite',
+    config() {
+      return { tailwindConfigHookRan: true };
+    },
+    configResolved(config) {
+      globalThis.__tailwindResolvedRoot = config.root;
+    },
+    transform(code, id) {
+      if (!id.endsWith('.css') || !code.includes('@import "tailwindcss"')) {
+        return null;
+      }
+      return {
+        code: code.replace('@import "tailwindcss";', [
+          '/*! compiled by fake @tailwindcss/vite */',
+          '.text-emerald-400 { color: rgb(52 211 153); }',
+          '.bg-slate-950 { background-color: rgb(2 6 23); }'
+        ].join('\\n')),
+      };
+    },
+  };
+};`
+    );
+  }
+
   beforeEach(() => {
     vfs = new VirtualFS();
 
@@ -387,6 +425,17 @@ h1 {
       expect(response.body.toString()).toContain('font-family');
     });
 
+    it('should serve CSS stylesheet requests as CSS when accept header asks for CSS', async () => {
+      const response = await server.handleRequest('GET', '/src/style.css', {
+        accept: 'text/css,*/*;q=0.1',
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['Content-Type']).toBe('text/css; charset=utf-8');
+      expect(response.body.toString()).toContain('font-family');
+      expect(response.body.toString()).not.toContain('export default css');
+    });
+
     it('should rewrite root-absolute CSS asset URLs relative to the CSS file', async () => {
       vfs.writeFileSync(
         '/src/asset-test.css',
@@ -404,7 +453,8 @@ h1 {
       expect(body).toContain("url('https://example.com/bg.png')");
     });
 
-    it('should strip Tailwind CSS import when the Vite Tailwind plugin is configured', async () => {
+    it('should execute a VFS-installed Tailwind Vite plugin for CSS transforms', async () => {
+      installFakeTailwindVitePlugin();
       vfs.writeFileSync(
         '/vite.config.ts',
         `import { defineConfig } from 'vite';
@@ -425,6 +475,8 @@ export default defineConfig({
       const body = response.body.toString();
 
       expect(response.statusCode).toBe(200);
+      expect(body).toContain('/*! compiled by fake @tailwindcss/vite */');
+      expect(body).toContain('.text-emerald-400');
       expect(body).not.toContain('@import "tailwindcss"');
       expect(body).toContain("url('../assets/card.svg')");
     });
@@ -489,7 +541,8 @@ export default defineConfig({
       expect(body).toContain('href="/__virtual__/3000/keep"');
     });
 
-    it('should inject Tailwind runtime when the Vite Tailwind plugin is configured', async () => {
+    it('should not inject the Tailwind CDN when the Vite Tailwind plugin is configured', async () => {
+      installFakeTailwindVitePlugin();
       vfs.writeFileSync(
         '/vite.config.ts',
         `import { defineConfig } from 'vite';
@@ -504,8 +557,7 @@ export default defineConfig({
       const body = response.body.toString();
 
       expect(response.statusCode).toBe(200);
-      expect(body).toContain('cdn.tailwindcss.com');
-      expect((body.match(/cdn\.tailwindcss\.com/g) || []).length).toBe(1);
+      expect(body).not.toContain('cdn.tailwindcss.com');
     });
 
     it('should inject script before </head>', async () => {

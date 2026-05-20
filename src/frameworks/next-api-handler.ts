@@ -270,6 +270,7 @@ export type StreamingMockResponse = ReturnType<typeof createStreamingMockRespons
 export async function createBuiltinModules(
   createFsShim?: () => unknown | Promise<unknown>
 ): Promise<Record<string, unknown>> {
+  const processShim = await import('../shims/process');
   const modules: Record<string, unknown> = {
     https: await import('../shims/https'),
     http: await import('../shims/http'),
@@ -281,10 +282,26 @@ export async function createBuiltinModules(
     stream: await import('../shims/stream'),
     buffer: await import('../shims/buffer'),
     crypto: await import('../shims/crypto'),
+    os: await import('../shims/os'),
+    assert: await import('../shims/assert'),
+    module: await import('../shims/module'),
+    child_process: await import('../shims/child_process'),
+    tty: await import('../shims/tty'),
+    vm: await import('../shims/vm'),
+    v8: await import('../shims/v8'),
+    zlib: await import('../shims/zlib'),
+    perf_hooks: await import('../shims/perf_hooks'),
+    async_hooks: await import('../shims/async_hooks'),
+    worker_threads: await import('../shims/worker_threads'),
+    process: processShim.default,
+    lightningcss: await import('../shims/lightningcss'),
   };
 
   if (createFsShim) {
     modules.fs = await createFsShim();
+    if (modules.fs && typeof modules.fs === 'object' && 'promises' in modules.fs) {
+      modules['fs/promises'] = (modules.fs as { promises: unknown }).promises;
+    }
   }
 
   return modules;

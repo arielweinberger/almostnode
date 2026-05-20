@@ -8,7 +8,8 @@ import { VirtualFS } from '../virtual-fs';
 import { Buffer } from '../shims/stream';
 import { simpleHash } from '../utils/hash';
 import { addReactRefresh as _addReactRefresh } from './code-transforms';
-import { ESBUILD_WASM_ESM_CDN, ESBUILD_WASM_BINARY_CDN, REACT_REFRESH_CDN, REACT_CDN, REACT_DOM_CDN, TAILWIND_CDN_URL } from '../config/cdn';
+import { ESBUILD_WASM_ESM_CDN, ESBUILD_WASM_BINARY_CDN, REACT_REFRESH_CDN, REACT_CDN, REACT_DOM_CDN } from '../config/cdn';
+import { VitePluginContainer } from './vite-plugin-container';
 
 // Check if we're in a real browser environment (not jsdom or Node.js)
 // jsdom has window but doesn't have ServiceWorker or SharedArrayBuffer
@@ -384,16 +385,13 @@ function rewriteCssRootUrls(css: string, filePath: string): string {
     );
 }
 
-function stripTailwindCssImport(css: string): string {
-  return css.replace(/@import\s+["']tailwindcss["']\s*;?/g, '');
-}
-
 export class ViteDevServer extends DevServer {
   private watcherCleanup: (() => void) | null = null;
   private options: ViteDevServerOptions;
   private hmrTargetWindow: Window | null = null;
   private transformCache: Map<string, { code: string; hash: string }> = new Map();
-  private tailwindPluginDetected: boolean | null = null;
+  private cssTransformCache: Map<string, { code: string; hash: string }> = new Map();
+  private pluginContainer: VitePluginContainer;
 
   constructor(vfs: VirtualFS, options: ViteDevServerOptions) {
     super(vfs, options);
@@ -404,6 +402,7 @@ export class ViteDevServer extends DevServer {
       jsxAutoImport: true,
       ...options,
     };
+    this.pluginContainer = new VitePluginContainer(vfs, this.root);
   }
 
   /**
@@ -474,15 +473,22 @@ export class ViteDevServer extends DevServer {
         headers['Sec-Fetch-Dest'] ||
         headers['SEC-FETCH-DEST'] ||
         '';
+      const accept =
+        headers['accept'] ||
+        headers['Accept'] ||
+        headers['ACCEPT'] ||
+        '';
+      const acceptsCss = accept.includes('text/css');
 
       // In browser, serve CSS as module when:
       // 1. Requested as a script (sec-fetch-dest: script)
       // 2. Empty dest (sec-fetch-dest: empty) - fetch() calls
-      // 3. No sec-fetch-dest but in browser context - assume module import
+      // 3. No sec-fetch-dest but in browser context and the request is not
+      //    clearly a stylesheet link request.
       const isModuleImport =
         secFetchDest === 'script' ||
         secFetchDest === 'empty' ||
-        (isBrowser && secFetchDest === '');
+        (isBrowser && secFetchDest === '' && !acceptsCss);
 
       if (isModuleImport) {
         return this.serveCssAsModule(filePath);
@@ -546,8 +552,12 @@ export class ViteDevServer extends DevServer {
    * Handle file change event
    */
   private handleFileChange(path: string): void {
+    this.transformCache.delete(path);
+    this.cssTransformCache.delete(path);
+
     if (/\/vite\.config\.(js|mjs|ts)$/.test(path)) {
-      this.tailwindPluginDetected = null;
+      this.pluginContainer.invalidate();
+      this.cssTransformCache.clear();
     }
 
     // Determine update type:
@@ -586,7 +596,8 @@ export class ViteDevServer extends DevServer {
     }
 
     this.hmrTargetWindow = null;
-    this.tailwindPluginDetected = null;
+    this.pluginContainer.invalidate();
+    this.cssTransformCache.clear();
 
     super.stop();
   }
@@ -727,9 +738,9 @@ export class ViteDevServer extends DevServer {
    * Serve CSS file as a JavaScript module that injects styles
    * This is needed because ES module imports of CSS files need to return JS
    */
-  private serveCssAsModule(filePath: string): ResponseData {
+  private async serveCssAsModule(filePath: string): Promise<ResponseData> {
     try {
-      const css = this.processCss(this.vfs.readFileSync(filePath, 'utf8'), filePath);
+      const css = await this.processCss(this.vfs.readFileSync(filePath, 'utf8'), filePath);
 
       // Create JavaScript that injects the CSS into the document
       const js = `
@@ -763,9 +774,9 @@ export default css;
     }
   }
 
-  private serveCssFile(filePath: string): ResponseData {
+  private async serveCssFile(filePath: string): Promise<ResponseData> {
     try {
-      const css = this.processCss(this.vfs.readFileSync(filePath, 'utf8'), filePath);
+      const css = await this.processCss(this.vfs.readFileSync(filePath, 'utf8'), filePath);
       const buffer = Buffer.from(css);
 
       return {
@@ -783,32 +794,22 @@ export default css;
     }
   }
 
-  private processCss(css: string, filePath: string): string {
-    const withoutTailwindImport = this.usesTailwindVitePlugin()
-      ? stripTailwindCssImport(css)
-      : css;
-    return rewriteCssRootUrls(withoutTailwindImport, filePath);
-  }
-
-  private usesTailwindVitePlugin(): boolean {
-    if (this.tailwindPluginDetected !== null) {
-      return this.tailwindPluginDetected;
+  private async processCss(css: string, filePath: string): Promise<string> {
+    const pluginKey = this.pluginContainer.getCacheKey();
+    const hash = simpleHash(`${pluginKey}\n${css}`);
+    const cached = this.cssTransformCache.get(filePath);
+    if (cached?.hash === hash) {
+      return cached.code;
     }
 
-    const configNames = ['vite.config.ts', 'vite.config.js', 'vite.config.mjs'];
-    this.tailwindPluginDetected = configNames.some((name) => {
-      const configPath = this.root === '/' ? `/${name}` : `${this.root}/${name}`;
-      if (!this.exists(configPath)) return false;
+    let transformed = css;
+    if (this.pluginContainer.getConfigPath()) {
+      transformed = await this.pluginContainer.transformCss(css, filePath);
+    }
 
-      try {
-        const content = this.vfs.readFileSync(configPath, 'utf8');
-        return content.includes('@tailwindcss/vite') || /\btailwindcss\s*\(/.test(content);
-      } catch {
-        return false;
-      }
-    });
-
-    return this.tailwindPluginDetected;
+    const code = rewriteCssRootUrls(transformed, filePath);
+    this.cssTransformCache.set(filePath, { code, hash });
+    return code;
   }
 
   /**
@@ -823,7 +824,6 @@ export default css;
     try {
       let content = this.vfs.readFileSync(filePath, 'utf8');
       content = rewriteHtmlRootUrls(content, filePath);
-      content = this.injectTailwindIfNeeded(content);
 
       // Inject a React import map if the HTML doesn't already have one.
       // This lets seed HTML omit the esm.sh boilerplate — the platform provides it.
@@ -894,20 +894,6 @@ export default css;
     }
   }
 
-  private injectTailwindIfNeeded(content: string): string {
-    if (!this.usesTailwindVitePlugin() || content.includes(TAILWIND_CDN_URL)) {
-      return content;
-    }
-
-    const script = `<script src="${TAILWIND_CDN_URL}"></script>`;
-    if (content.includes('</head>')) {
-      return content.replace('</head>', `${script}\n</head>`);
-    }
-    if (content.includes('<head>')) {
-      return content.replace('<head>', `<head>\n${script}`);
-    }
-    return `${script}\n${content}`;
-  }
 }
 
 export default ViteDevServer;

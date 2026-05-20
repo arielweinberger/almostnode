@@ -6,6 +6,7 @@ import { VirtualFS } from './virtual-fs';
 import { ViteDevServer } from './frameworks/vite-dev-server';
 import { getServerBridge } from './server-bridge';
 import { Buffer } from './shims/stream';
+import { PackageManager } from './npm';
 
 export const VITE_TAILWIND_DEMO_FILES: Record<string, string> = {
   '/package.json': JSON.stringify(
@@ -123,6 +124,15 @@ export async function startViteTailwindDevServer(
   const bridge = getServerBridge();
 
   try {
+    log('Installing Tailwind packages from package.json...');
+    const packageManager = new PackageManager(vfs, { cwd: '/' });
+    await packageManager.installFromPackageJson({
+      includeDev: true,
+      includeOptional: true,
+      onProgress: log,
+    });
+    log('Tailwind packages installed');
+
     log('Initializing Service Worker...');
     await bridge.initServiceWorker();
     log('Service Worker ready');

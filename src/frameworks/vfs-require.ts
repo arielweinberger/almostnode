@@ -80,8 +80,8 @@ export function createVfsRequire(
         if (vfs.existsSync(indexPath)) return indexPath;
       } catch { /* ignore */ }
     }
-    // Try extensions
-    for (const ext of ['.js', '.json']) {
+    // Try extensions commonly used by packages and config files.
+    for (const ext of ['.js', '.mjs', '.cjs', '.json']) {
       const withExt = basePath + ext;
       if (vfs.existsSync(withExt)) return withExt;
     }
@@ -125,9 +125,9 @@ export function createVfsRequire(
       // If root import (no sub-path), use browser/module/main
       if (pkgName === moduleId) {
         let main: string | undefined;
-        if (typeof pkg.browser === 'string') main = pkg.browser;
-        if (!main && pkg.module) main = pkg.module as string;
-        if (!main) main = pkg.main || 'index.js';
+        main = pkg.main || (pkg.module as string | undefined);
+        if (!main && typeof pkg.browser === 'string') main = pkg.browser;
+        if (!main) main = 'index.js';
         const resolvedMain = tryResolveFile(pathShim.join(pkgRoot, main));
         if (resolvedMain) return resolvedMain;
       }
@@ -203,11 +203,15 @@ export function createVfsRequire(
 
     // Safety-net ESM→CJS transform (packages should already be CJS from PackageManager)
     if (!resolvedPath.endsWith('.cjs')) {
-      const hasEsm = /\bimport\b|\bexport\b/.test(code);
+      const hasEsm = /\bimport\b|\bexport\b|\bimport\.meta\b/.test(code);
       if (hasEsm) {
         code = transformEsmToCjsSimple(code);
       }
     }
+    code = code
+      .replace(/\bimport\.meta\.url\b/g, JSON.stringify(`file://${resolvedPath}`))
+      .replace(/\bimport\.meta\.filename\b/g, JSON.stringify(resolvedPath))
+      .replace(/\bimport\.meta\.dirname\b/g, JSON.stringify(dirname));
 
     // Create require scoped to this module's directory
     const moduleRequire = (id: string) => requireFn(id, dirname);

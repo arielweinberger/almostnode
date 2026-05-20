@@ -25,13 +25,14 @@ export interface FsShim {
   readdirSync(path: PathLike): string[];
   readdirSync(path: PathLike, options: { withFileTypes: true }): Dirent[];
   readdirSync(path: PathLike, options?: { withFileTypes?: boolean; encoding?: string } | string): string[] | Dirent[];
-  statSync(path: PathLike): Stats;
-  lstatSync(path: PathLike): Stats;
-  fstatSync(fd: number): Stats;
+  statSync(path: PathLike, options?: { bigint?: boolean }): Stats;
+  lstatSync(path: PathLike, options?: { bigint?: boolean }): Stats;
+  fstatSync(fd: number, options?: { bigint?: boolean }): Stats;
   unlinkSync(path: PathLike): void;
   rmdirSync(path: PathLike): void;
   renameSync(oldPath: PathLike, newPath: PathLike): void;
   realpathSync(path: PathLike): string;
+  readlinkSync(path: PathLike): string;
   accessSync(path: PathLike, mode?: number): void;
   copyFileSync(src: PathLike, dest: PathLike): void;
   openSync(path: string, flags: string | number, mode?: number): number;
@@ -189,12 +190,21 @@ function toPath(pathLike: unknown, getCwd?: () => string): string {
   return path;
 }
 
+function toBigIntStats(stats: Stats): Stats {
+  const converted = { ...stats } as Record<string, unknown>;
+  for (const key of ['size', 'mode', 'mtimeMs', 'atimeMs', 'ctimeMs', 'birthtimeMs', 'nlink', 'uid', 'gid', 'dev', 'ino', 'rdev', 'blksize', 'blocks']) {
+    converted[key] = BigInt(Math.trunc(Number(converted[key] ?? 0)));
+  }
+  return converted as unknown as Stats;
+}
+
 // File descriptor tracking
 interface FileDescriptor {
   path: string;
   position: number;
   flags: string;
   content: Uint8Array;
+  isDirectory?: boolean;
 }
 
 const fdMap = new Map<number, FileDescriptor>();
@@ -475,7 +485,7 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
       return entries;
     },
 
-    statSync(pathLike: unknown): Stats {
+    statSync(pathLike: unknown, options?: { bigint?: boolean }): Stats {
       const origPath = typeof pathLike === 'string' ? pathLike : String(pathLike);
       const path = resolvePath(pathLike);
       trackCall('statSync', path);
@@ -485,14 +495,15 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
         const wasRemapped = origPath !== path;
         console.log(`[fs] statSync(${origPath}${wasRemapped ? ' -> ' + path : ''}) -> isDir: ${result.isDirectory()}`);
       }
-      return result;
+      return options?.bigint ? toBigIntStats(result) : result;
     },
 
-    lstatSync(pathLike: unknown): Stats {
-      return vfs.lstatSync(resolvePath(pathLike));
+    lstatSync(pathLike: unknown, options?: { bigint?: boolean }): Stats {
+      const result = vfs.lstatSync(resolvePath(pathLike));
+      return options?.bigint ? toBigIntStats(result) : result;
     },
 
-    fstatSync(fd: number): Stats {
+    fstatSync(fd: number, options?: { bigint?: boolean }): Stats {
       const entry = fdMap.get(fd);
       if (!entry) {
         const err = new Error(`EBADF: bad file descriptor, fstat`) as Error & { code: string; errno: number };
@@ -500,7 +511,8 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
         err.errno = -9;
         throw err;
       }
-      return vfs.statSync(entry.path);
+      const result = vfs.statSync(entry.path);
+      return options?.bigint ? toBigIntStats(result) : result;
     },
 
     openSync(pathLike: unknown, flags: string | number, _mode?: number): number {
@@ -522,8 +534,15 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
 
       // Get or create content
       let content: Uint8Array;
+      let isDirectory = false;
       if (exists && !flagStr.includes('w')) {
-        content = vfs.readFileSync(path);
+        const stats = vfs.statSync(path);
+        isDirectory = stats.isDirectory();
+        if (isDirectory) {
+          content = new Uint8Array(0);
+        } else {
+          content = vfs.readFileSync(path);
+        }
       } else {
         content = new Uint8Array(0);
         if (isWriteMode) {
@@ -541,6 +560,7 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
         position: flagStr.includes('a') ? content.length : 0,
         flags: flagStr,
         content: new Uint8Array(content),
+        isDirectory,
       });
       return fd;
     },
@@ -551,7 +571,7 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
         return; // Silently ignore
       }
       // Write back content if it was opened for writing
-      if (entry.flags.includes('w') || entry.flags.includes('a') || entry.flags.includes('+')) {
+      if (!entry.isDirectory && (entry.flags.includes('w') || entry.flags.includes('a') || entry.flags.includes('+'))) {
         vfs.writeFileSync(entry.path, entry.content);
       }
       fdMap.delete(fd);
@@ -713,6 +733,15 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
         },
       }
     ),
+
+    readlinkSync(pathLike: unknown): string {
+      const path = resolvePath(pathLike);
+      const err = new Error(`EINVAL: invalid argument, readlink '${path}'`) as Error & { code: string; errno: number; path: string };
+      err.code = 'EINVAL';
+      err.errno = -22;
+      err.path = path;
+      throw err;
+    },
 
     accessSync(pathLike: unknown, _mode?: number): void {
       vfs.accessSync(resolvePath(pathLike));

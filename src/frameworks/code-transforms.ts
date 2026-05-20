@@ -367,7 +367,7 @@ function transformEsmToCjsAst(code: string): string {
 
       if (specs.length === 0) {
         // Side-effect import: import './polyfill'
-        replacements.push([node.start, node.end, `require(${JSON.stringify(source)})`]);
+        replacements.push([node.start, node.end, `require(${JSON.stringify(source)});`]);
       } else {
         const defaultSpec = specs.find((s: any) => s.type === 'ImportDefaultSpecifier');
         const nsSpec = specs.find((s: any) => s.type === 'ImportNamespaceSpecifier');
@@ -393,7 +393,7 @@ function transformEsmToCjsAst(code: string): string {
             parts.push(`const { ${bindings} } = require(${JSON.stringify(source)})`);
           }
         }
-        replacements.push([node.start, node.end, parts.join(';\n')]);
+        replacements.push([node.start, node.end, `${parts.join(';\n')};`]);
       }
     } else if (node.type === 'ExportDefaultDeclaration') {
       const decl = node.declaration;
@@ -469,13 +469,26 @@ function transformEsmToCjsAst(code: string): string {
 function transformEsmToCjsRegex(code: string): string {
   let transformed = code;
 
+  const normalizeNamedImports = (names: string) => names
+    .split(',')
+    .map((name) => {
+      const trimmed = name.trim();
+      const aliasMatch = trimmed.match(/^([\w$]+)\s+as\s+([\w$]+)$/);
+      return aliasMatch ? `${aliasMatch[1]}: ${aliasMatch[2]}` : trimmed;
+    })
+    .join(', ');
+
   transformed = transformed.replace(
-    /import\s+(\w+)\s+from\s+['"]([^'"]+)['"]/g,
-    'const $1 = require("$2")',
+    /import\s+(\w+)\s+from\s*['"]([^'"]+)['"]/g,
+    'const $1 = require("$2");',
   );
   transformed = transformed.replace(
-    /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g,
-    'const {$1} = require("$2")',
+    /import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g,
+    (_match, names: string, source: string) => `const {${normalizeNamedImports(names)}} = require("${source}");`,
+  );
+  transformed = transformed.replace(
+    /import\s*\*\s*as\s+(\w+)\s+from\s*['"]([^'"]+)['"]/g,
+    'const $1 = require("$2");',
   );
   transformed = transformed.replace(
     /export\s+default\s+function\s+(\w+)/g,
@@ -500,6 +513,24 @@ function transformEsmToCjsRegex(code: string): string {
   transformed = transformed.replace(
     /export\s+const\s+(\w+)\s*=/g,
     'exports.$1 =',
+  );
+  transformed = transformed.replace(
+    /export\s*\{\s*([\w$]+)\s+as\s+default\s*\}\s*;?/g,
+    'module.exports = $1;',
+  );
+  transformed = transformed.replace(
+    /export\s*\{([^}]+)\}\s*;?/g,
+    (_match, names: string) => names
+      .split(',')
+      .map((name) => {
+        const trimmed = name.trim();
+        const aliasMatch = trimmed.match(/^([\w$]+)\s+as\s+([\w$]+)$/);
+        if (aliasMatch) {
+          return `exports.${aliasMatch[2]} = ${aliasMatch[1]};`;
+        }
+        return `exports.${trimmed} = ${trimmed};`;
+      })
+      .join('\n'),
   );
 
   return transformed;
