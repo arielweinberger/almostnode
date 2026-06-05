@@ -26,6 +26,14 @@ interface ResolveContext {
   options: ResolveOptions;
 }
 
+interface ResolvePackageOptions {
+  optional?: boolean;
+  direct?: boolean;
+}
+
+const BROWSER_OPTIONAL_OS = new Set(['browser', 'web', 'wasm32', 'wasi']);
+const BROWSER_OPTIONAL_CPU = new Set(['wasm32', 'none']);
+
 /**
  * Parse a semver version string into components
  */
@@ -254,7 +262,7 @@ export async function resolveDependencies(
     options,
   };
 
-  await resolvePackage(packageName, versionRange, context);
+  await resolvePackage(packageName, versionRange, context, { direct: true });
 
   return context.resolved;
 }
@@ -284,7 +292,7 @@ export async function resolveFromPackageJson(
   }
 
   for (const [name, range] of Object.entries(deps)) {
-    await resolvePackage(name, range, context);
+    await resolvePackage(name, range, context, { direct: true });
   }
 
   return context.resolved;
@@ -296,7 +304,8 @@ export async function resolveFromPackageJson(
 async function resolvePackage(
   packageName: string,
   versionRange: string,
-  context: ResolveContext
+  context: ResolveContext,
+  requestOptions: ResolvePackageOptions = {}
 ): Promise<void> {
   const { registry, resolved, resolving, options } = context;
 
@@ -315,8 +324,12 @@ async function resolvePackage(
       return;
     }
     // If existing version doesn't satisfy, we might need nested deps
-    // For MVP, we'll just use the existing version (flat node_modules)
-    return;
+    // For top-level package.json dependencies, prefer the user's direct
+    // constraint over an earlier transitive or peer dependency guess.
+    if (!requestOptions.direct) {
+      // For MVP, we'll just use the existing version (flat node_modules)
+      return;
+    }
   }
 
   resolving.add(key);
@@ -348,6 +361,11 @@ async function resolvePackage(
     // Get version metadata
     const versionData = manifest.versions[targetVersion];
 
+    if (requestOptions.optional && !supportsBrowserOptionalPackage(versionData)) {
+      options.onProgress?.(`Skipping optional ${packageName}@${targetVersion} (unsupported browser target)`);
+      return;
+    }
+
     // Store resolved package
     const resolvedPackage: ResolvedPackage = {
       name: packageName,
@@ -375,9 +393,8 @@ async function resolvePackage(
     // Regular dependencies override peer deps
     Object.assign(deps, versionData.dependencies);
 
-    if (options.includeOptional && versionData.optionalDependencies) {
-      Object.assign(deps, versionData.optionalDependencies);
-    }
+    const optionalDeps = versionData.optionalDependencies || {};
+    if (options.includeOptional) Object.assign(deps, optionalDeps);
 
     const depEntries = Object.entries(deps);
     if (depEntries.length > 0) {
@@ -386,13 +403,54 @@ async function resolvePackage(
       for (let i = 0; i < depEntries.length; i += CONCURRENCY) {
         const batch = depEntries.slice(i, i + CONCURRENCY);
         await Promise.all(
-          batch.map(([depName, depRange]) => resolvePackage(depName, depRange, context))
+          batch.map(([depName, depRange]) =>
+            resolvePackage(depName, depRange, context, {
+              optional: hasOwnRecordKey(optionalDeps, depName),
+            })
+          )
         );
       }
     }
   } finally {
     resolving.delete(key);
   }
+}
+
+function supportsBrowserOptionalPackage(versionData: PackageVersion): boolean {
+  return (
+    matchesBrowserConstraint(versionData.os, BROWSER_OPTIONAL_OS) &&
+    matchesBrowserConstraint(versionData.cpu, BROWSER_OPTIONAL_CPU)
+  );
+}
+
+function matchesBrowserConstraint(
+  value: string | string[] | undefined,
+  supported: Set<string>
+): boolean {
+  const constraints = normalizeConstraint(value);
+  const positive = constraints.filter((constraint) => !constraint.startsWith('!'));
+  const negative = constraints
+    .filter((constraint) => constraint.startsWith('!'))
+    .map((constraint) => constraint.slice(1));
+
+  if (negative.some((constraint) => supported.has(constraint))) {
+    return false;
+  }
+
+  if (positive.length === 0) {
+    return true;
+  }
+
+  return positive.some((constraint) => supported.has(constraint));
+}
+
+function normalizeConstraint(value: string | string[] | undefined): string[] {
+  if (!value) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function hasOwnRecordKey(record: Record<string, string>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
 }
 
 // Export utilities for testing

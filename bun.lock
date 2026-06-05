@@ -3,7 +3,7 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "almostnode",
+      "name": "@startdev/almostnode",
       "dependencies": {
         "@ai-sdk/openai": "^3.0.28",
         "@ai-sdk/react": "^3.0.87",

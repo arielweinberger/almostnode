@@ -328,9 +328,12 @@ describe('ViteDevServer', () => {
       if (!id.endsWith('.css') || !code.includes('@import "tailwindcss"')) {
         return null;
       }
+      const count = (globalThis.__tailwindTransformCount || 0) + 1;
+      globalThis.__tailwindTransformCount = count;
       return {
         code: code.replace('@import "tailwindcss";', [
           '/*! compiled by fake @tailwindcss/vite */',
+          '.transform-count-' + count + ' { --count: ' + count + '; }',
           '.text-emerald-400 { color: rgb(52 211 153); }',
           '.bg-slate-950 { background-color: rgb(2 6 23); }'
         ].join('\\n')),
@@ -342,6 +345,8 @@ describe('ViteDevServer', () => {
   }
 
   beforeEach(() => {
+    Reflect.deleteProperty(globalThis, '__tailwindTransformCount');
+
     vfs = new VirtualFS();
 
     // Create a minimal React project structure
@@ -476,9 +481,35 @@ export default defineConfig({
 
       expect(response.statusCode).toBe(200);
       expect(body).toContain('/*! compiled by fake @tailwindcss/vite */');
+      expect(body).toContain('.transform-count-1');
       expect(body).toContain('.text-emerald-400');
       expect(body).not.toContain('@import "tailwindcss"');
       expect(body).toContain("url('../assets/card.svg')");
+    });
+
+    it('should invalidate cached Tailwind CSS output when source files change', async () => {
+      installFakeTailwindVitePlugin();
+      vfs.writeFileSync(
+        '/vite.config.ts',
+        `import { defineConfig } from 'vite';
+import tailwindcss from '@tailwindcss/vite';
+
+export default defineConfig({
+  plugins: [tailwindcss()],
+});`
+      );
+      vfs.writeFileSync('/src/tailwind.css', '@import "tailwindcss";');
+
+      const first = await server.handleRequest('GET', '/src/tailwind.css', {});
+      expect(first.body.toString()).toContain('.transform-count-1');
+
+      const cached = await server.handleRequest('GET', '/src/tailwind.css', {});
+      expect(cached.body.toString()).toContain('.transform-count-1');
+
+      server.notifyFileChanged('/src/App.jsx');
+
+      const afterSourceChange = await server.handleRequest('GET', '/src/tailwind.css', {});
+      expect(afterSourceChange.body.toString()).toContain('.transform-count-2');
     });
 
     it('should return 404 for missing files', async () => {
@@ -929,6 +960,22 @@ export default App;`
       expect(listener).toHaveBeenCalled();
       const update = listener.mock.calls[0][0];
       expect(update.type).toBe('update');
+    });
+
+    it('should emit Tailwind CSS updates when source content files change', () => {
+      const listener = vi.fn();
+      server.on('hmr-update', listener);
+
+      vfs.writeFileSync('/src/tailwind.css', '@import "tailwindcss";');
+
+      server.notifyFileChanged('/src/App.jsx');
+
+      const updates = listener.mock.calls.map((call) => call[0]);
+      expect(updates.map((update) => update.path)).toEqual([
+        '/src/tailwind.css',
+        '/src/App.jsx',
+      ]);
+      expect(updates.every((update) => update.type === 'update')).toBe(true);
     });
 
     it('should watch Vite root-level entry file types', async () => {

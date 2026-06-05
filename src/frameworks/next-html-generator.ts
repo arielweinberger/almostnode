@@ -7,7 +7,6 @@
 import { Buffer } from '../shims/stream';
 import { ResponseData } from '../dev-server';
 import {
-  TAILWIND_CDN_SCRIPT,
   CORS_PROXY_SCRIPT,
   REACT_REFRESH_PREAMBLE,
   HMR_CLIENT_SCRIPT,
@@ -29,7 +28,6 @@ export interface HtmlGeneratorContext {
   port: number;
   exists: (path: string) => boolean;
   generateEnvScript: () => string;
-  loadTailwindConfigIfNeeded: () => Promise<string>;
   /** Additional import map entries (e.g., framework-specific CDN mappings) */
   additionalImportMap?: Record<string, string>;
 }
@@ -69,9 +67,6 @@ export async function generateAppRouterHtml(
   // Generate env script for NEXT_PUBLIC_* variables
   const envScript = ctx.generateEnvScript();
 
-  // Load Tailwind config if available (must be injected BEFORE CDN script)
-  const tailwindConfigScript = await ctx.loadTailwindConfigIfNeeded();
-
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -80,8 +75,6 @@ export async function generateAppRouterHtml(
   <base href="${virtualPrefix}/">
   <title>Next.js App</title>
   ${envScript}
-  ${TAILWIND_CDN_SCRIPT}
-  ${tailwindConfigScript}
   ${CORS_PROXY_SCRIPT}
   ${globalCssLinks.join('\n  ')}
   <script type="importmap">
@@ -162,35 +155,38 @@ export async function generateAppRouterHtml(
     }
 
     // Dynamic page loader with retry (SW may need time to recover after idle termination)
-    async function loadPage(pathname) {
+    async function loadPage(pathname, cacheBuster) {
       const info = await resolveRoute(pathname);
       if (!info.found || !info.page) return null;
       const modulePath = virtualBase + '/_next/app' + info.page;
+      let lastError = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const module = await import(/* @vite-ignore */ modulePath + (attempt > 0 ? '?retry=' + attempt : ''));
+          const suffix = cacheBuster ? '?t=' + cacheBuster : (attempt > 0 ? '?retry=' + attempt : '');
+          const module = await import(/* @vite-ignore */ modulePath + suffix);
           return module.default;
         } catch (e) {
+          lastError = e;
           console.warn('[Navigation] Load attempt ' + (attempt + 1) + ' failed:', modulePath, e.message);
           if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
         }
       }
       console.error('[Navigation] Failed to load page after 3 attempts:', modulePath);
-      return null;
+      throw lastError || new Error('Failed to load page: ' + modulePath);
     }
 
     // Load layouts (with caching)
     const layoutCache = new Map();
-    async function loadLayouts(pathname) {
+    async function loadLayouts(pathname, cacheBuster) {
       const info = await resolveRoute(pathname);
       const layoutPaths = (info.layouts || []).map(l => virtualBase + '/_next/app' + l);
       const layouts = [];
       for (const path of layoutPaths) {
-        if (layoutCache.has(path)) {
+        if (!cacheBuster && layoutCache.has(path)) {
           layouts.push(layoutCache.get(path));
         } else {
           try {
-            const module = await import(/* @vite-ignore */ path);
+            const module = await import(/* @vite-ignore */ path + (cacheBuster ? '?t=' + cacheBuster : ''));
             layoutCache.set(path, module.default);
             layouts.push(module.default);
           } catch (e) {
@@ -227,6 +223,43 @@ export async function generateAppRouterHtml(
       }
     }
     await loadConventionComponents();
+
+    function getErrorMessage(error) {
+      if (error && error.stack) return error.stack;
+      if (error && error.message) return error.message;
+      return String(error);
+    }
+
+    function PreviewError({ error }) {
+      return React.createElement('main', {
+        style: {
+          minHeight: '100vh',
+          boxSizing: 'border-box',
+          padding: '24px',
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+          background: '#fff1f2',
+          color: '#881337',
+        },
+      },
+        React.createElement('h1', {
+          style: {
+            margin: '0 0 12px',
+            fontSize: '20px',
+            lineHeight: '28px',
+          },
+        }, 'Preview failed to compile'),
+        React.createElement('pre', {
+          style: {
+            margin: 0,
+            maxWidth: '100%',
+            overflow: 'auto',
+            whiteSpace: 'pre-wrap',
+            fontSize: '13px',
+            lineHeight: '20px',
+          },
+        }, getErrorMessage(error))
+      );
+    }
 
     // Error boundary class component
     class ErrorBoundary extends React.Component {
@@ -309,12 +342,25 @@ export async function generateAppRouterHtml(
       const [layouts, setLayouts] = React.useState([]);
       const [path, setPath] = React.useState(window.location.pathname);
       const [search, setSearch] = React.useState(window.location.search);
+      const [loadError, setLoadError] = React.useState(null);
 
       React.useEffect(() => {
-        Promise.all([loadPage(path), loadLayouts(path)]).then(([P, L]) => {
-          if (P) setPage(() => P);
-          setLayouts(L);
-        });
+        let cancelled = false;
+        Promise.all([loadPage(path), loadLayouts(path)])
+          .then(([P, L]) => {
+            if (cancelled) return;
+            setLoadError(null);
+            if (P) setPage(() => P);
+            setLayouts(L);
+          })
+          .catch((error) => {
+            if (cancelled) return;
+            console.error('[Router] Failed to load route:', error);
+            setLoadError(error);
+            setPage(null);
+            setLayouts([]);
+          });
+        return () => { cancelled = true; };
       }, []);
 
       React.useEffect(() => {
@@ -331,11 +377,19 @@ export async function generateAppRouterHtml(
           if (newPath !== path) {
             console.log('[Router] Path changed, loading new page...');
             setPath(newPath);
-            const [P, L, routeInfo] = await Promise.all([loadPage(newPath), loadLayouts(newPath), resolveRoute(newPath)]);
-            window.__NEXT_ROUTE_PARAMS__ = routeInfo.params || {};
-            console.log('[Router] Page loaded:', !!P, 'Layouts:', L.length);
-            if (P) setPage(() => P);
-            setLayouts(L);
+            try {
+              const [P, L, routeInfo] = await Promise.all([loadPage(newPath), loadLayouts(newPath), resolveRoute(newPath)]);
+              window.__NEXT_ROUTE_PARAMS__ = routeInfo.params || {};
+              console.log('[Router] Page loaded:', !!P, 'Layouts:', L.length);
+              setLoadError(null);
+              if (P) setPage(() => P);
+              setLayouts(L);
+            } catch (error) {
+              console.error('[Router] Failed to load route:', error);
+              setLoadError(error);
+              setPage(null);
+              setLayouts([]);
+            }
           } else {
             console.log('[Router] Path unchanged, skipping navigation');
           }
@@ -345,6 +399,42 @@ export async function generateAppRouterHtml(
         return () => window.removeEventListener('popstate', handleNavigation);
       }, [path, search]);
 
+      React.useEffect(() => {
+        const handleDevUpdate = async (event) => {
+          const timestamp = event.detail?.timestamp || Date.now();
+          const newPath = window.location.pathname;
+          const newSearch = window.location.search;
+
+          if (newSearch !== search) {
+            setSearch(newSearch);
+          }
+          if (newPath !== path) {
+            setPath(newPath);
+          }
+
+          try {
+            const [P, L, routeInfo] = await Promise.all([
+              loadPage(newPath, timestamp),
+              loadLayouts(newPath, timestamp),
+              resolveRoute(newPath),
+            ]);
+            window.__NEXT_ROUTE_PARAMS__ = routeInfo.params || {};
+            setLoadError(null);
+            if (P) setPage(() => P);
+            setLayouts(L);
+          } catch (error) {
+            console.error('[Router] Failed to load route update:', error);
+            setLoadError(error);
+            setPage(null);
+            setLayouts([]);
+          }
+        };
+
+        window.addEventListener('next-dev-hmr-update', handleDevUpdate);
+        return () => window.removeEventListener('next-dev-hmr-update', handleDevUpdate);
+      }, [path, search]);
+
+      if (loadError) return React.createElement(PreviewError, { error: loadError });
       if (!Page) return null;
 
       // Render page via PageWrapper so hooks work correctly
@@ -407,9 +497,6 @@ export async function generatePageHtml(
   // Generate env script for NEXT_PUBLIC_* variables
   const envScript = ctx.generateEnvScript();
 
-  // Load Tailwind config if available (must be injected BEFORE CDN script)
-  const tailwindConfigScript = await ctx.loadTailwindConfigIfNeeded();
-
   // Build additional import map entries from context
   const pagesAdditionalEntries = ctx.additionalImportMap
     ? Object.entries(ctx.additionalImportMap)
@@ -425,8 +512,6 @@ export async function generatePageHtml(
   <base href="${virtualPrefix}/">
   <title>Next.js App</title>
   ${envScript}
-  ${TAILWIND_CDN_SCRIPT}
-  ${tailwindConfigScript}
   ${CORS_PROXY_SCRIPT}
   ${globalCssLinks.join('\n  ')}
   <script type="importmap">
@@ -472,24 +557,75 @@ export async function generatePageHtml(
     }
 
     // Dynamic page loader
-    async function loadPage(pathname) {
+    async function loadPage(pathname, cacheBuster) {
       const modulePath = getPageModulePath(pathname);
       try {
-        const module = await import(/* @vite-ignore */ modulePath);
+        const module = await import(/* @vite-ignore */ modulePath + (cacheBuster ? '?t=' + cacheBuster : ''));
         return module.default;
       } catch (e) {
         console.error('[Navigation] Failed to load:', modulePath, e);
-        return null;
+        throw e;
       }
+    }
+
+    function getErrorMessage(error) {
+      if (error && error.stack) return error.stack;
+      if (error && error.message) return error.message;
+      return String(error);
+    }
+
+    function PreviewError({ error }) {
+      return React.createElement('main', {
+        style: {
+          minHeight: '100vh',
+          boxSizing: 'border-box',
+          padding: '24px',
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+          background: '#fff1f2',
+          color: '#881337',
+        },
+      },
+        React.createElement('h1', {
+          style: {
+            margin: '0 0 12px',
+            fontSize: '20px',
+            lineHeight: '28px',
+          },
+        }, 'Preview failed to compile'),
+        React.createElement('pre', {
+          style: {
+            margin: 0,
+            maxWidth: '100%',
+            overflow: 'auto',
+            whiteSpace: 'pre-wrap',
+            fontSize: '13px',
+            lineHeight: '20px',
+          },
+        }, getErrorMessage(error))
+      );
     }
 
     // Router component
     function Router() {
       const [Page, setPage] = React.useState(null);
       const [path, setPath] = React.useState(window.location.pathname);
+      const [loadError, setLoadError] = React.useState(null);
 
       React.useEffect(() => {
-        loadPage(path).then(C => C && setPage(() => C));
+        let cancelled = false;
+        loadPage(path)
+          .then(C => {
+            if (cancelled) return;
+            setLoadError(null);
+            if (C) setPage(() => C);
+          })
+          .catch(error => {
+            if (cancelled) return;
+            console.error('[Router] Failed to load route:', error);
+            setLoadError(error);
+            setPage(null);
+          });
+        return () => { cancelled = true; };
       }, []);
 
       React.useEffect(() => {
@@ -497,14 +633,43 @@ export async function generatePageHtml(
           const newPath = window.location.pathname;
           if (newPath !== path) {
             setPath(newPath);
-            const C = await loadPage(newPath);
-            if (C) setPage(() => C);
+            try {
+              const C = await loadPage(newPath);
+              setLoadError(null);
+              if (C) setPage(() => C);
+            } catch (error) {
+              console.error('[Router] Failed to load route:', error);
+              setLoadError(error);
+              setPage(null);
+            }
           }
         };
         window.addEventListener('popstate', handleNavigation);
         return () => window.removeEventListener('popstate', handleNavigation);
       }, [path]);
 
+      React.useEffect(() => {
+        const handleDevUpdate = async (event) => {
+          const timestamp = event.detail?.timestamp || Date.now();
+          const newPath = window.location.pathname;
+          if (newPath !== path) {
+            setPath(newPath);
+          }
+          try {
+            const C = await loadPage(newPath, timestamp);
+            setLoadError(null);
+            if (C) setPage(() => C);
+          } catch (error) {
+            console.error('[Router] Failed to load route update:', error);
+            setLoadError(error);
+            setPage(null);
+          }
+        };
+        window.addEventListener('next-dev-hmr-update', handleDevUpdate);
+        return () => window.removeEventListener('next-dev-hmr-update', handleDevUpdate);
+      }, [path]);
+
+      if (loadError) return React.createElement(PreviewError, { error: loadError });
       if (!Page) return null;
       return React.createElement(Page);
     }

@@ -43,13 +43,13 @@ Built by the creators of [Macaly.com](https://macaly.com) — a tool that lets a
 ### Installation
 
 ```bash
-npm install almostnode
+npm install @startdev/almostnode
 ```
 
 ### Basic Usage
 
 ```typescript
-import { createContainer } from 'almostnode';
+import { createContainer } from '@startdev/almostnode';
 
 // Create a Node.js container in the browser
 const container = createContainer();
@@ -72,7 +72,7 @@ console.log(result.exports); // "Hello from the browser!"
 ### Running Untrusted Code Securely
 
 ```typescript
-import { createRuntime, VirtualFS } from 'almostnode';
+import { createRuntime, VirtualFS } from '@startdev/almostnode';
 
 const vfs = new VirtualFS();
 
@@ -90,7 +90,7 @@ See [Sandbox Setup](#sandbox-setup) for deployment instructions.
 ### Working with Virtual File System
 
 ```typescript
-import { createContainer } from 'almostnode';
+import { createContainer } from '@startdev/almostnode';
 
 const container = createContainer();
 const { vfs } = container;
@@ -113,7 +113,7 @@ const result = container.runFile('/src/index.js');
 ### With npm Packages
 
 ```typescript
-import { createContainer } from 'almostnode';
+import { createContainer } from '@startdev/almostnode';
 
 const container = createContainer();
 
@@ -131,7 +131,7 @@ container.execute(`
 ### Running Shell Commands
 
 ```typescript
-import { createContainer } from 'almostnode';
+import { createContainer } from '@startdev/almostnode';
 
 const container = createContainer();
 
@@ -194,7 +194,7 @@ controller.abort();
 ### With Next.js Dev Server
 
 ```typescript
-import { VirtualFS, NextDevServer, getServerBridge } from 'almostnode';
+import { VirtualFS, NextDevServer, getServerBridge } from '@startdev/almostnode';
 
 const vfs = new VirtualFS();
 
@@ -236,8 +236,8 @@ almostnode uses a Service Worker to intercept HTTP requests and route them to vi
 | Use Case | Setup Required |
 |----------|----------------|
 | Cross-origin sandbox (recommended for untrusted code) | `generateSandboxFiles()` - includes everything |
-| Same-origin with Vite | `almostnodePlugin` from `almostnode/vite` |
-| Same-origin with Next.js | `getServiceWorkerContent` from `almostnode/next` |
+| Same-origin with Vite | `almostnodePlugin` from `@startdev/almostnode/vite` |
+| Same-origin with Next.js | `getServiceWorkerContent` from `@startdev/almostnode/next` |
 | Same-origin with other frameworks | Manual copy to public directory |
 
 ---
@@ -249,7 +249,7 @@ When using `createRuntime()` with a cross-origin `sandbox` URL, the service work
 The `generateSandboxFiles()` helper generates all required files:
 
 ```typescript
-import { generateSandboxFiles } from 'almostnode';
+import { generateSandboxFiles } from '@startdev/almostnode';
 import fs from 'fs';
 
 const files = generateSandboxFiles();
@@ -282,7 +282,7 @@ For trusted code using `dangerouslyAllowSameOrigin: true`:
 ```typescript
 // vite.config.ts
 import { defineConfig } from 'vite';
-import { almostnodePlugin } from 'almostnode/vite';
+import { almostnodePlugin } from '@startdev/almostnode/vite';
 
 export default defineConfig({
   plugins: [almostnodePlugin()]
@@ -311,7 +311,7 @@ For trusted code using `dangerouslyAllowSameOrigin: true`:
 
 ```typescript
 // app/__sw__.js/route.ts
-import { getServiceWorkerContent } from 'almostnode/next';
+import { getServiceWorkerContent } from '@startdev/almostnode/next';
 
 export async function GET() {
   return new Response(getServiceWorkerContent(), {
@@ -327,7 +327,7 @@ export async function GET() {
 
 ```typescript
 // pages/api/__sw__.ts
-import { getServiceWorkerContent } from 'almostnode/next';
+import { getServiceWorkerContent } from '@startdev/almostnode/next';
 import type { NextApiRequest, NextApiResponse } from 'next';
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -347,7 +347,7 @@ await bridge.initServiceWorker({ swUrl: '/__sw__.js' });
 await bridge.initServiceWorker({ swUrl: '/api/__sw__' });
 ```
 
-**Available exports from `almostnode/next`:**
+**Available exports from `@startdev/almostnode/next`:**
 
 | Export | Description |
 |--------|-------------|
@@ -361,13 +361,13 @@ await bridge.initServiceWorker({ swUrl: '/api/__sw__' });
 Copy the service worker to your public directory:
 
 ```bash
-cp node_modules/almostnode/dist/__sw__.js ./public/
+cp node_modules/@startdev/almostnode/dist/__sw__.js ./public/
 ```
 
 Or programmatically:
 
 ```typescript
-import { getServiceWorkerPath } from 'almostnode/next';
+import { getServiceWorkerPath } from '@startdev/almostnode/next';
 import fs from 'fs';
 
 fs.copyFileSync(getServiceWorkerPath(), './public/__sw__.js');
@@ -398,7 +398,7 @@ fs.copyFileSync(getServiceWorkerPath(), './public/__sw__.js');
 ### Example: Code Playground
 
 ```typescript
-import { createContainer } from 'almostnode';
+import { createContainer } from '@startdev/almostnode';
 
 function createPlayground() {
   const container = createContainer();
@@ -530,7 +530,7 @@ const module = runtime.require('/path/to/module.js');
 For advanced use cases, use `createRuntime` to create a runtime with security options:
 
 ```typescript
-import { createRuntime, VirtualFS } from 'almostnode';
+import { createRuntime, VirtualFS } from '@startdev/almostnode';
 
 const vfs = new VirtualFS();
 
@@ -571,7 +571,7 @@ For running untrusted code securely, deploy a cross-origin sandbox. The key requ
 ### Quick Setup (Vercel)
 
 ```typescript
-import { generateSandboxFiles } from 'almostnode';
+import { generateSandboxFiles } from '@startdev/almostnode';
 import fs from 'fs';
 
 const files = generateSandboxFiles();
@@ -604,7 +604,7 @@ Create an `index.html` that loads almostnode and handles postMessage:
 <head><meta charset="UTF-8"></head>
 <body>
 <script type="module">
-  import { VirtualFS, Runtime } from 'https://unpkg.com/almostnode/dist/index.js';
+  import { VirtualFS, Runtime } from 'https://unpkg.com/@startdev/almostnode/dist/index.js';
 
   let vfs = null;
   let runtime = null;
@@ -806,7 +806,7 @@ These modules export empty objects or no-op functions:
 ### Vite
 
 ```typescript
-import { VirtualFS, ViteDevServer, getServerBridge } from 'almostnode';
+import { VirtualFS, ViteDevServer, getServerBridge } from '@startdev/almostnode';
 
 const vfs = new VirtualFS();
 
@@ -962,7 +962,7 @@ Start the dev server with `npm run dev` and open any demo at `http://localhost:5
 ### Setup
 
 ```bash
-git clone https://github.com/macaly/almostnode.git
+git clone https://github.com/arielweinberger/almostnode.git
 cd almostnode
 npm install
 ```

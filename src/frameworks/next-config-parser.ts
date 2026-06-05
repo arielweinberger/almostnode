@@ -6,7 +6,7 @@
  */
 
 import * as acorn from 'acorn';
-import { stripTypescriptSyntax } from './tailwind-config-loader';
+import { stripTypescriptSyntax } from './typescript-syntax';
 
 /**
  * Parse a string value from a Next.js config file.

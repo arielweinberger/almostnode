@@ -5,6 +5,7 @@
 
 import { VirtualFS } from '../virtual-fs';
 import { Registry, RegistryOptions } from './registry';
+import type { PackageManifest } from './registry';
 import {
   resolveDependencies,
   resolveFromPackageJson,
@@ -27,6 +28,183 @@ function normalizeBin(pkgName: string, bin?: Record<string, string> | string): R
     return { [cmdName]: bin };
   }
   return bin;
+}
+
+interface CachedPackageFile {
+  relativePath: string;
+  content: Uint8Array;
+}
+
+interface CachedPackage {
+  files: CachedPackageFile[];
+  byteLength: number;
+}
+
+const PACKAGE_CACHE_VERSION = 1;
+const MAX_SHARED_PACKAGE_CACHE_BYTES = 256 * 1024 * 1024;
+const PERSISTENT_PACKAGE_CACHE_DB = 'almostnode-package-cache';
+const PERSISTENT_PACKAGE_CACHE_STORE = 'packages';
+const PERSISTENT_PACKAGE_CACHE_VERSION = 1;
+
+const sharedRegistryCache = new Map<string, PackageManifest>();
+const sharedPackageCache = new Map<string, CachedPackage>();
+let sharedPackageCacheBytes = 0;
+
+function packageCacheKey(pkg: ResolvedPackage, transform: boolean): string {
+  return [
+    PACKAGE_CACHE_VERSION,
+    pkg.name,
+    pkg.version,
+    pkg.tarballUrl,
+    transform ? 'transform' : 'raw',
+  ].join('|');
+}
+
+function readCachedPackage(cacheKey: string): CachedPackage | null {
+  const cached = sharedPackageCache.get(cacheKey);
+  if (!cached) return null;
+
+  sharedPackageCache.delete(cacheKey);
+  sharedPackageCache.set(cacheKey, cached);
+  return cached;
+}
+
+function writeCachedPackage(cacheKey: string, cached: CachedPackage): void {
+  if (cached.byteLength > MAX_SHARED_PACKAGE_CACHE_BYTES) return;
+
+  const existing = sharedPackageCache.get(cacheKey);
+  if (existing) {
+    sharedPackageCacheBytes -= existing.byteLength;
+    sharedPackageCache.delete(cacheKey);
+  }
+
+  sharedPackageCache.set(cacheKey, cached);
+  sharedPackageCacheBytes += cached.byteLength;
+
+  while (sharedPackageCacheBytes > MAX_SHARED_PACKAGE_CACHE_BYTES) {
+    const oldestKey = sharedPackageCache.keys().next().value;
+    if (!oldestKey) break;
+
+    const oldest = sharedPackageCache.get(oldestKey);
+    if (oldest) sharedPackageCacheBytes -= oldest.byteLength;
+    sharedPackageCache.delete(oldestKey);
+  }
+}
+
+function hasPersistentPackageCache(): boolean {
+  return typeof indexedDB !== 'undefined';
+}
+
+function isCachedPackage(value: unknown): value is CachedPackage {
+  if (typeof value !== 'object' || value === null) return false;
+  if (!('files' in value) || !('byteLength' in value)) return false;
+
+  const candidate = value;
+  return Array.isArray(candidate.files) && typeof candidate.byteLength === 'number';
+}
+
+function openPersistentPackageCache(): Promise<IDBDatabase | null> {
+  if (!hasPersistentPackageCache()) return Promise.resolve(null);
+
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(
+      PERSISTENT_PACKAGE_CACHE_DB,
+      PERSISTENT_PACKAGE_CACHE_VERSION
+    );
+
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(PERSISTENT_PACKAGE_CACHE_STORE)) {
+        database.createObjectStore(PERSISTENT_PACKAGE_CACHE_STORE);
+      }
+    };
+    request.onerror = () => reject(request.error ?? new Error('Failed to open package cache'));
+    request.onsuccess = () => resolve(request.result);
+  });
+}
+
+async function readPersistentCachedPackage(cacheKey: string): Promise<CachedPackage | null> {
+  const database = await openPersistentPackageCache();
+  if (!database) return null;
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(PERSISTENT_PACKAGE_CACHE_STORE, 'readonly');
+    const store = transaction.objectStore(PERSISTENT_PACKAGE_CACHE_STORE);
+    const request = store.get(cacheKey);
+
+    request.onerror = () => reject(request.error ?? new Error('Failed to read package cache'));
+    request.onsuccess = () => {
+      const cached: unknown = request.result;
+      resolve(isCachedPackage(cached) ? cached : null);
+    };
+    transaction.oncomplete = () => database.close();
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error ?? new Error('Package cache read aborted'));
+    };
+  });
+}
+
+async function writePersistentCachedPackage(cacheKey: string, cached: CachedPackage): Promise<void> {
+  if (cached.byteLength > MAX_SHARED_PACKAGE_CACHE_BYTES) return;
+
+  const database = await openPersistentPackageCache();
+  if (!database) return;
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(PERSISTENT_PACKAGE_CACHE_STORE, 'readwrite');
+    const store = transaction.objectStore(PERSISTENT_PACKAGE_CACHE_STORE);
+    const request = store.put(cached, cacheKey);
+
+    request.onerror = () => reject(request.error ?? new Error('Failed to write package cache'));
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error ?? new Error('Package cache write aborted'));
+    };
+  });
+}
+
+function snapshotPackageFiles(vfs: VirtualFS, packagePath: string): CachedPackage {
+  const files: CachedPackageFile[] = [];
+  let byteLength = 0;
+
+  const visit = (absolutePath: string, relativeBase: string) => {
+    for (const entry of vfs.readdirSync(absolutePath)) {
+      const childPath = path.join(absolutePath, entry);
+      const relativePath = relativeBase ? path.join(relativeBase, entry) : entry;
+      const stats = vfs.statSync(childPath);
+
+      if (stats.isDirectory()) {
+        visit(childPath, relativePath);
+        continue;
+      }
+
+      if (!stats.isFile()) continue;
+
+      const content = vfs.readFileSync(childPath);
+      const snapshot = new Uint8Array(content);
+      byteLength += snapshot.byteLength;
+      files.push({ relativePath, content: snapshot });
+    }
+  };
+
+  visit(packagePath, '');
+
+  return { files, byteLength };
+}
+
+function restoreCachedPackage(
+  vfs: VirtualFS,
+  packagePath: string,
+  cached: CachedPackage
+): void {
+  for (const file of cached.files) {
+    vfs.writeFileSync(path.join(packagePath, file.relativePath), new Uint8Array(file.content));
+  }
 }
 
 export interface InstallOptions {
@@ -55,7 +233,10 @@ export class PackageManager {
 
   constructor(vfs: VirtualFS, options: { cwd?: string } & RegistryOptions = {}) {
     this.vfs = vfs;
-    this.registry = new Registry(options);
+    this.registry = new Registry({
+      ...options,
+      cache: options.cache ?? sharedRegistryCache,
+    });
     this.cwd = options.cwd || '/';
   }
 
@@ -188,44 +369,14 @@ export class PackageManager {
 
       await Promise.all(
         batch.map(async ({ name, pkg, pkgPath }) => {
-          onProgress?.(`  Downloading ${name}@${pkg.version}...`);
-
-          // Download and extract tarball
-          await downloadAndExtract(pkg.tarballUrl, this.vfs, pkgPath, {
-            stripComponents: 1, // Strip "package/" prefix
+          await this.installPackage({
+            name,
+            pkg,
+            pkgPath,
+            nodeModulesPath,
+            shouldTransform,
+            onProgress,
           });
-
-          // Transform ESM to CJS
-          if (shouldTransform) {
-            try {
-              const count = await transformPackage(this.vfs, pkgPath, onProgress);
-              if (count > 0) {
-                onProgress?.(`  Transformed ${count} files in ${name}`);
-              }
-            } catch (transformError) {
-              onProgress?.(`  Warning: Transform failed for ${name}: ${transformError}`);
-            }
-          }
-
-          // Create bin stubs in /node_modules/.bin/
-          try {
-            const pkgJsonPath = path.join(pkgPath, 'package.json');
-            if (this.vfs.existsSync(pkgJsonPath)) {
-              const pkgJson = JSON.parse(this.vfs.readFileSync(pkgJsonPath, 'utf8'));
-              const binEntries = normalizeBin(name, pkgJson.bin);
-              const binDir = path.join(nodeModulesPath, '.bin');
-              for (const [cmdName, entryPath] of Object.entries(binEntries)) {
-                this.vfs.mkdirSync(binDir, { recursive: true });
-                const targetPath = path.join(pkgPath, entryPath);
-                this.vfs.writeFileSync(
-                  path.join(binDir, cmdName),
-                  `node "${targetPath}" "$@"\n`
-                );
-              }
-            }
-          } catch {
-            // Non-critical — skip if bin stub creation fails
-          }
 
           added.push(name);
         })
@@ -236,6 +387,84 @@ export class PackageManager {
     await this.writeLockfile(resolved);
 
     return added;
+  }
+
+  private async installPackage({
+    name,
+    pkg,
+    pkgPath,
+    nodeModulesPath,
+    shouldTransform,
+    onProgress,
+  }: {
+    name: string;
+    pkg: ResolvedPackage;
+    pkgPath: string;
+    nodeModulesPath: string;
+    shouldTransform: boolean;
+    onProgress?: (message: string) => void;
+  }): Promise<void> {
+    const cacheKey = packageCacheKey(pkg, shouldTransform);
+    const cached = readCachedPackage(cacheKey);
+
+    if (cached) {
+      onProgress?.(`  Restoring ${name}@${pkg.version} from shared cache...`);
+      restoreCachedPackage(this.vfs, pkgPath, cached);
+      this.createBinStubs(name, pkgPath, nodeModulesPath);
+      return;
+    }
+
+    const persistentCached = await readPersistentCachedPackage(cacheKey).catch(() => null);
+    if (persistentCached) {
+      onProgress?.(`  Restoring ${name}@${pkg.version} from persistent cache...`);
+      writeCachedPackage(cacheKey, persistentCached);
+      restoreCachedPackage(this.vfs, pkgPath, persistentCached);
+      this.createBinStubs(name, pkgPath, nodeModulesPath);
+      return;
+    }
+
+    onProgress?.(`  Downloading ${name}@${pkg.version}...`);
+
+    // Download and extract tarball
+    await downloadAndExtract(pkg.tarballUrl, this.vfs, pkgPath, {
+      stripComponents: 1, // Strip "package/" prefix
+    });
+
+    // Transform ESM to CJS
+    if (shouldTransform) {
+      try {
+        const count = await transformPackage(this.vfs, pkgPath, onProgress);
+        if (count > 0) {
+          onProgress?.(`  Transformed ${count} files in ${name}`);
+        }
+      } catch (transformError) {
+        onProgress?.(`  Warning: Transform failed for ${name}: ${transformError}`);
+      }
+    }
+
+    const packageSnapshot = snapshotPackageFiles(this.vfs, pkgPath);
+    writeCachedPackage(cacheKey, packageSnapshot);
+    await writePersistentCachedPackage(cacheKey, packageSnapshot).catch(() => undefined);
+    this.createBinStubs(name, pkgPath, nodeModulesPath);
+  }
+
+  private createBinStubs(name: string, pkgPath: string, nodeModulesPath: string): void {
+    try {
+      const pkgJsonPath = path.join(pkgPath, 'package.json');
+      if (!this.vfs.existsSync(pkgJsonPath)) return;
+
+      const pkgJson = JSON.parse(this.vfs.readFileSync(pkgJsonPath, 'utf8'));
+      const binEntries = normalizeBin(name, pkgJson.bin);
+      const binDir = path.join(nodeModulesPath, '.bin');
+
+      for (const [cmdName, entryPath] of Object.entries(binEntries)) {
+        this.vfs.mkdirSync(binDir, { recursive: true });
+        const targetPath = path.join(pkgPath, entryPath);
+        this.vfs.writeFileSync(path.join(binDir, cmdName), `node "${targetPath}" "$@"\n`);
+      }
+    } catch {
+      // Non-critical — skip if bin stub creation fails
+    }
   }
 
   /**

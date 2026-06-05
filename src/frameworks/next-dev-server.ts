@@ -6,9 +6,10 @@
 import { DevServer, DevServerOptions, ResponseData, HMRUpdate } from '../dev-server';
 import { VirtualFS } from '../virtual-fs';
 import { Buffer } from '../shims/stream';
+import * as pathShim from '../shims/path';
 import { simpleHash } from '../utils/hash';
-import { loadTailwindConfig } from './tailwind-config-loader';
 import { parseNextConfigValue } from './next-config-parser';
+import { NextCssProcessor } from './next-css-processor';
 import {
   redirectNpmImports as _redirectNpmImports,
   stripCssImports as _stripCssImports,
@@ -53,6 +54,7 @@ import {
 import { createVfsRequire, type VfsModule } from './vfs-require';
 import { bundleNpmModuleForBrowser, clearNpmBundleCache, initNpmServe } from './npm-serve';
 import { ESBUILD_WASM_ESM_CDN, ESBUILD_WASM_BINARY_CDN } from '../config/cdn';
+import { importExternalModule } from '../utils/external-import';
 
 // Check if we're in a real browser environment (not jsdom or Node.js)
 const isBrowser = typeof window !== 'undefined' &&
@@ -77,10 +79,11 @@ async function initEsbuild(): Promise<void> {
 
   window.__esbuildInitPromise = (async () => {
     try {
-      const mod = await import(
-        /* @vite-ignore */
-        ESBUILD_WASM_ESM_CDN
-      );
+      const mod = await importExternalModule<
+        typeof import('esbuild-wasm') & {
+          default?: typeof import('esbuild-wasm');
+        }
+      >(ESBUILD_WASM_ESM_CDN);
 
       const esbuildMod = mod.default || mod;
 
@@ -187,6 +190,12 @@ export class NextDevServer extends DevServer {
   /** Transform result cache for performance */
   private transformCache: Map<string, { code: string; hash: string }> = new Map();
 
+  /** CSS transform result cache for Tailwind/PostCSS output */
+  private cssTransformCache: Map<string, { code: string; hash: string }> = new Map();
+
+  /** CSS processor for official Next.js PostCSS/Tailwind setups */
+  private cssProcessor: NextCssProcessor;
+
   /** Path aliases from tsconfig.json (e.g., @/* -> ./*) */
   private pathAliases: Map<string, string> = new Map();
 
@@ -197,12 +206,15 @@ export class NextDevServer extends DevServer {
    * Create a VFS-based require function for API route handlers.
    * Resolves npm packages from /node_modules/ in VFS.
    */
-  private createApiVfsRequire(builtinModules: Record<string, unknown>): (id: string) => unknown {
+  private createApiVfsRequire(
+    builtinModules: Record<string, unknown>,
+    fromDir = '/'
+  ): (id: string) => unknown {
     const env: Record<string, string> = { ...this.options.env };
     if (this.options.corsProxy) {
       env.CORS_PROXY_URL = this.options.corsProxy;
     }
-    const { require: vfsRequire } = createVfsRequire(this.vfs, '/', {
+    const { require: vfsRequire } = createVfsRequire(this.vfs, fromDir, {
       builtinModules,
       process: {
         env,
@@ -215,12 +227,6 @@ export class NextDevServer extends DevServer {
     });
     return vfsRequire;
   }
-
-  /** Cached Tailwind config script (injected before CDN) */
-  private tailwindConfigScript: string = '';
-
-  /** Whether Tailwind config has been loaded */
-  private tailwindConfigLoaded: boolean = false;
 
   /** Asset prefix for static files (e.g., '/marketing') */
   private assetPrefix: string = '';
@@ -243,6 +249,7 @@ export class NextDevServer extends DevServer {
 
     // Initialize esbuild VFS so /_npm/ bundling can resolve from node_modules
     initNpmServe(vfs);
+    this.cssProcessor = new NextCssProcessor(vfs, this.root);
 
     // Inject CORS proxy URL into env so API handlers get it via process.env
     if (options.corsProxy) {
@@ -441,34 +448,6 @@ export class NextDevServer extends DevServer {
   }
 
   /**
-   * Load Tailwind config from tailwind.config.ts and generate a script
-   * that configures the Tailwind CDN at runtime
-   */
-  private async loadTailwindConfigIfNeeded(): Promise<string> {
-    // Return cached script if already loaded
-    if (this.tailwindConfigLoaded) {
-      return this.tailwindConfigScript;
-    }
-
-    try {
-      const result = await loadTailwindConfig(this.vfs, this.root);
-
-      if (result.success) {
-        this.tailwindConfigScript = result.configScript;
-      } else if (result.error) {
-        console.warn('[NextDevServer] Tailwind config warning:', result.error);
-        this.tailwindConfigScript = '';
-      }
-    } catch (error) {
-      console.warn('[NextDevServer] Failed to load tailwind.config:', error);
-      this.tailwindConfigScript = '';
-    }
-
-    this.tailwindConfigLoaded = true;
-    return this.tailwindConfigScript;
-  }
-
-  /**
    * Handle an incoming HTTP request
    */
   async handleRequest(
@@ -570,11 +549,17 @@ export class NextDevServer extends DevServer {
       if (needsTransform(resolvedFile)) {
         return this.transformAndServe(resolvedFile, pathname);
       }
+      if (resolvedFile.endsWith('.css')) {
+        return this.serveCssFile(resolvedFile);
+      }
       return this.serveFile(resolvedFile);
     }
 
     // Serve regular files directly if they exist
     if (this.exists(pathname) && !this.isDirectory(pathname)) {
+      if (pathname.endsWith('.css')) {
+        return this.serveCssFile(pathname);
+      }
       return this.serveFile(pathname);
     }
 
@@ -759,7 +744,7 @@ export class NextDevServer extends DevServer {
       if (this.options.apiModules) {
         Object.assign(builtins, this.options.apiModules);
       }
-      const vfsRequire = this.createApiVfsRequire(builtins);
+      const vfsRequire = this.createApiVfsRequire(builtins, pathShim.dirname(apiFile));
       const result = await executeApiHandler(transformed, req, res, this.options.env, builtins, vfsRequire);
 
       // If the handler returned a Response object, convert it to ResponseData
@@ -819,11 +804,13 @@ export class NextDevServer extends DevServer {
       const transformed = await this.transformApiHandler(code, routeFile);
 
       // Create module context and execute the route handler
-      const builtinModules = await createBuiltinModules();
+      const builtinModules = await createBuiltinModules(
+        () => import('../shims/fs').then(m => m.createFsShim(this.vfs))
+      );
       if (this.options.apiModules) {
         Object.assign(builtinModules, this.options.apiModules);
       }
-      const vfsRequire = this.createApiVfsRequire(builtinModules);
+      const vfsRequire = this.createApiVfsRequire(builtinModules, pathShim.dirname(routeFile));
 
       const require = (id: string): unknown => {
         const modId = id.startsWith('node:') ? id.slice(5) : id;
@@ -985,7 +972,7 @@ export class NextDevServer extends DevServer {
       if (this.options.apiModules) {
         Object.assign(builtins, this.options.apiModules);
       }
-      const vfsRequire = this.createApiVfsRequire(builtins);
+      const vfsRequire = this.createApiVfsRequire(builtins, pathShim.dirname(apiFile));
       const result = await executeApiHandler(transformed, req, res, this.options.env, builtins, vfsRequire);
 
       // If the handler returned a Response object (Web API style), stream it
@@ -1050,7 +1037,7 @@ export class NextDevServer extends DevServer {
       if (this.options.apiModules) {
         Object.assign(builtinModules, this.options.apiModules);
       }
-      const vfsRequire = this.createApiVfsRequire(builtinModules);
+      const vfsRequire = this.createApiVfsRequire(builtinModules, pathShim.dirname(routeFile));
 
       const require = (id: string): unknown => {
         const modId = id.startsWith('node:') ? id.slice(5) : id;
@@ -1234,7 +1221,6 @@ export class NextDevServer extends DevServer {
       port: this.port,
       exists: (path: string) => this.exists(path),
       generateEnvScript: () => this.generateEnvScript(),
-      loadTailwindConfigIfNeeded: () => this.loadTailwindConfigIfNeeded(),
       additionalImportMap: this.options.additionalImportMap,
     };
   }
@@ -1315,7 +1301,12 @@ export class NextDevServer extends DevServer {
     } catch (error) {
       console.error('[NextDevServer] Transform error:', error);
       const message = error instanceof Error ? error.message : 'Transform failed';
-      const body = `// Transform Error: ${message}\nconsole.error(${JSON.stringify(message)});`;
+      const body = `const message = ${JSON.stringify(message)};
+console.error(message);
+const error = new Error(message);
+error.name = "TransformError";
+throw error;
+`;
       return {
         statusCode: 200,
         statusMessage: 'OK',
@@ -1433,7 +1424,52 @@ export class NextDevServer extends DevServer {
   clearInstalledPackagesCache(): void {
     this._installedPackages = undefined;
     this._dependencies = undefined;
+    this.cssTransformCache.clear();
     clearNpmBundleCache();
+  }
+
+  private async serveCssFile(filePath: string): Promise<ResponseData> {
+    try {
+      const normalizedPath = this.resolvePath(filePath);
+      const css = this.vfs.readFileSync(normalizedPath, 'utf8');
+      const processedCss = await this.processCss(css, normalizedPath);
+      const buffer = Buffer.from(processedCss);
+
+      return {
+        statusCode: 200,
+        statusMessage: 'OK',
+        headers: {
+          'Content-Type': 'text/css; charset=utf-8',
+          'Content-Length': String(buffer.length),
+          'Cache-Control': 'no-cache',
+        },
+        body: buffer,
+      };
+    } catch (error) {
+      return this.serverError(error);
+    }
+  }
+
+  private async processCss(css: string, filePath: string): Promise<string> {
+    const processorKey = this.cssProcessor.getCacheKey();
+    const hash = simpleHash(`${processorKey}\n${css}`);
+    const cached = this.cssTransformCache.get(filePath);
+    if (cached?.hash === hash) {
+      return cached.code;
+    }
+
+    const processedCss = await this.cssProcessor.process(css, filePath);
+    this.cssTransformCache.set(filePath, { code: processedCss, hash });
+    return processedCss;
+  }
+
+  private getCompiledTailwindCssPaths(): string[] {
+    const cssLocations = ['/app/globals.css', '/styles/globals.css', '/styles/global.css'];
+    return cssLocations.filter((cssPath) => {
+      if (!this.exists(cssPath)) return false;
+      const css = this.vfs.readFileSync(cssPath, 'utf8');
+      return this.cssProcessor.shouldCompileTailwindCss(css);
+    });
   }
 
   /**
@@ -1569,6 +1605,19 @@ export class NextDevServer extends DevServer {
       // Ignore if public directory doesn't exist
     }
 
+    // Watch root-level config files that affect CSS compilation.
+    try {
+      const rootWatcher = this.vfs.watch(this.root, { recursive: false }, (eventType, filename) => {
+        if (eventType === 'change' && filename && /^(postcss\.config\.(js|mjs|cjs)|tailwind\.config\.(js|mjs|ts)|package\.json)$/.test(filename)) {
+          const fullPath = this.root === '/' ? `/${filename}` : `${this.root}/${filename}`;
+          this.handleFileChange(fullPath);
+        }
+      });
+      watchers.push(rootWatcher);
+    } catch {
+      // Ignore if root watching fails
+    }
+
     this.watcherCleanup = () => {
       watchers.forEach(w => w.close());
     };
@@ -1577,17 +1626,45 @@ export class NextDevServer extends DevServer {
   /**
    * Handle file change event
    */
+  notifyFileChanged(path: string): void {
+    this.handleFileChange(path.startsWith('/') ? path : `/${path}`);
+  }
+
   private handleFileChange(path: string): void {
+    this.transformCache.delete(path);
     const isCSS = path.endsWith('.css');
     const isJS = /\.(jsx?|tsx?)$/.test(path);
+    const isContentFile = isJS || /\.(html|mdx?)$/.test(path);
+
+    if (
+      isCSS ||
+      isContentFile ||
+      /\/(?:postcss|tailwind)\.config\.(js|mjs|cjs|ts)$/.test(path) ||
+      path.endsWith('/package.json')
+    ) {
+      this.cssTransformCache.clear();
+    }
+
+    if (!isCSS && isContentFile) {
+      for (const cssPath of this.getCompiledTailwindCssPaths()) {
+        this.sendHMRUpdate({
+          type: 'update',
+          path: cssPath,
+          timestamp: Date.now(),
+        });
+      }
+    }
+
     const updateType = (isCSS || isJS) ? 'update' : 'full-reload';
 
-    const update: HMRUpdate = {
+    this.sendHMRUpdate({
       type: updateType,
       path,
       timestamp: Date.now(),
-    };
+    });
+  }
 
+  private sendHMRUpdate(update: HMRUpdate): void {
     this.emitHMRUpdate(update);
 
     // Send HMR update via postMessage (works with sandboxed iframes)

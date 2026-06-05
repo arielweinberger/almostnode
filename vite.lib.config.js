@@ -53,6 +53,7 @@ export default defineConfig({
     lib: {
       entry: {
         index: resolve(__dirname, 'src/index.ts'),
+        'browser-runtime': resolve(__dirname, 'src/browser-runtime.ts'),
         'vite-plugin': resolve(__dirname, 'src/vite-plugin.ts'),
         'next-plugin': resolve(__dirname, 'src/next-plugin.ts'),
       },

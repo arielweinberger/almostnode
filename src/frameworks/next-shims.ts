@@ -4,12 +4,7 @@
  * These are injected into generated HTML pages as inline scripts or served as virtual modules.
  */
 
-import { REACT_REFRESH_CDN, TAILWIND_CDN_URL } from '../config/cdn';
-
-/**
- * Tailwind CSS CDN script for runtime JIT compilation
- */
-export const TAILWIND_CDN_SCRIPT = `<script src="${TAILWIND_CDN_URL}"></script>`;
+import { REACT_REFRESH_CDN } from '../config/cdn';
 
 /**
  * CORS Proxy script - provides proxyFetch function in the iframe
@@ -153,13 +148,20 @@ export const HMR_CLIENT_SCRIPT = `
         if (pendingUpdates.size === 1) {
           setTimeout(async () => {
             try {
-              for (const [modulePath, ts] of pendingUpdates) {
+              const appliedUpdates = Array.from(pendingUpdates);
+              for (const [modulePath, ts] of appliedUpdates) {
                 const moduleUrl = '.' + modulePath + '?t=' + ts;
                 await import(moduleUrl);
               }
 
               window.$RefreshRuntime$.performReactRefresh();
               console.log('[HMR] Updated', pendingUpdates.size, 'module(s)');
+
+              for (const [modulePath, ts] of appliedUpdates) {
+                window.dispatchEvent(new CustomEvent('next-dev-hmr-update', {
+                  detail: { path: modulePath, timestamp: ts },
+                }));
+              }
 
               pendingUpdates.clear();
             } catch (error) {

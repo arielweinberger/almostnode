@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-05
+
+### Added
+- **Start.dev scoped package**: Renamed the npm package to `@startdev/almostnode` with public publish metadata for the maintained Start.dev fork.
+- **Browser runtime export**: Added `@startdev/almostnode/browser-runtime` for browser-local integrations that need the VFS, package manager, and dev server APIs without server-only helpers.
+- **Next.js + Tailwind v4 support**: Added browser-side CSS processing for conventional Next.js global CSS, PostCSS, and Tailwind v4 package setups.
+- **Persistent package install cache**: npm package installs now cache extracted/transformed package directories in IndexedDB so hard reloads can restore packages without downloading tarballs again.
+- **Next + Tailwind v4 demo and E2E coverage**: Added a focused demo page and Playwright coverage for the Next.js/Tailwind runtime path.
+
+### Fixed
+- **Next App Router route handlers**: API and route-handler module resolution now uses the handler file directory, allowing relative imports from App Router handlers.
+- **Next preview compile errors**: Transform failures now throw runtime errors that surface in the iframe instead of silently rendering a blank preview.
+- **Direct dependency precedence**: Top-level `package.json` dependencies now override broad transitive or peer ranges in the flat install map, keeping exact lesson pins deterministic across reloads.
+- **Tailwind v4 in browser runtime**: Removed the Tailwind CDN config path in favor of processing the real project CSS pipeline.
+- **Vite Tailwind HMR cache invalidation**: Source file changes now invalidate compiled Tailwind CSS output and emit CSS updates, so newly added utility classes appear without a full restart.
+
 ## [0.2.14] - 2026-02-14
 
 ### Added

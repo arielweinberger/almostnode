@@ -335,10 +335,19 @@ export default function handler(req, res) {
       // The new implementation uses dynamic imports for client-side navigation
       // instead of reloading the page on popstate events
       expect(html).toContain('function Router()');
-      expect(html).toContain('async function loadPage(pathname)');
+      expect(html).toContain('async function loadPage(pathname, cacheBuster)');
       expect(html).toContain("window.addEventListener('popstate'");
       // Should NOT contain the old reload behavior
       expect(html).not.toContain('window.location.reload()');
+    });
+
+    it('should include an in-preview compile error surface', async () => {
+      const response = await server.handleRequest('GET', '/', {});
+      const html = response.body.toString();
+
+      expect(html).toContain('Preview failed to compile');
+      expect(html).toContain('setLoadError');
+      expect(html).toContain('[Router] Failed to load route');
     });
   });
 
@@ -918,7 +927,7 @@ describe('NextDevServer environment variables', () => {
 
       // Should have the Router component for dynamic navigation
       expect(html).toContain('function Router()');
-      expect(html).toContain('async function loadPage(pathname)');
+      expect(html).toContain('async function loadPage(pathname, cacheBuster)');
       expect(html).toContain("window.addEventListener('popstate'");
       // Should NOT contain window.location.reload
       expect(html).not.toContain('window.location.reload()');
@@ -1632,7 +1641,7 @@ describe('JSON file serving as ES modules', () => {
   });
 });
 
-describe('Tailwind config integration', () => {
+describe('Tailwind CSS integration', () => {
   let vfs: VirtualFS;
   let server: NextDevServer;
 
@@ -1655,7 +1664,7 @@ describe('Tailwind config integration', () => {
     );
   });
 
-  it('should inject tailwind config before CDN script in App Router HTML', async () => {
+  it('should not inject Tailwind CDN or tailwind.config scripts in App Router HTML', async () => {
     vfs.writeFileSync(
       '/tailwind.config.ts',
       `import type { Config } from "tailwindcss"
@@ -1680,20 +1689,11 @@ export default {
     expect(response.statusCode).toBe(200);
     const html = response.body.toString();
 
-    // Config script should be in the HTML
-    expect(html).toContain('tailwind.config');
-    expect(html).toContain('brand');
-    expect(html).toContain('var(--brand-500)');
-
-    // Config should come AFTER the CDN script (CDN creates tailwind global, then we configure it)
-    const configIndex = html.indexOf('tailwind.config =');
-    const cdnIndex = html.indexOf('cdn.tailwindcss.com');
-    expect(configIndex).toBeGreaterThan(-1);
-    expect(cdnIndex).toBeGreaterThan(-1);
-    expect(configIndex).toBeGreaterThan(cdnIndex);
+    expect(html).not.toContain('cdn.tailwindcss.com');
+    expect(html).not.toContain('tailwind.config');
   });
 
-  it('should inject tailwind config after CDN script in Pages Router HTML', async () => {
+  it('should not inject Tailwind CDN or tailwind.config scripts in Pages Router HTML', async () => {
     // Create Pages Router structure instead
     vfs.mkdirSync('/pages', { recursive: true });
     vfs.writeFileSync(
@@ -1723,20 +1723,11 @@ export default {
     expect(response.statusCode).toBe(200);
     const html = response.body.toString();
 
-    // Config script should be in the HTML
-    expect(html).toContain('tailwind.config');
-    expect(html).toContain('primary');
-    expect(html).toContain('#0066cc');
-
-    // Config should come AFTER the CDN script (CDN creates tailwind global, then we configure it)
-    const configIndex = html.indexOf('tailwind.config =');
-    const cdnIndex = html.indexOf('cdn.tailwindcss.com');
-    expect(configIndex).toBeGreaterThan(-1);
-    expect(cdnIndex).toBeGreaterThan(-1);
-    expect(configIndex).toBeGreaterThan(cdnIndex);
+    expect(html).not.toContain('cdn.tailwindcss.com');
+    expect(html).not.toContain('tailwind.config');
   });
 
-  it('should work without tailwind config (CDN defaults)', async () => {
+  it('should not inject Tailwind CDN when there is no Tailwind config', async () => {
     // No tailwind.config.ts file
 
     server = new NextDevServer(vfs, { port: 3001 });
@@ -1745,48 +1736,19 @@ export default {
     expect(response.statusCode).toBe(200);
     const html = response.body.toString();
 
-    // CDN script should still be present
-    expect(html).toContain('cdn.tailwindcss.com');
-
-    // But no custom config (tailwind.config = ... should not be present)
+    expect(html).not.toContain('cdn.tailwindcss.com');
     expect(html).not.toContain('tailwind.config =');
   });
 
-  it('should handle complex tailwind config with animations and CSS variables', async () => {
+  it('should link global CSS instead of using Tailwind runtime config', async () => {
     vfs.writeFileSync(
-      '/tailwind.config.ts',
-      `import type { Config } from "tailwindcss"
+      '/app/globals.css',
+      `@import "tailwindcss";
 
-export default {
-  darkMode: ["class"],
-  content: ["./app/**/*.tsx"],
-  theme: {
-    extend: {
-      fontFamily: {
-        sans: ["var(--font-sans)", "sans-serif"]
-      },
-      colors: {
-        brand: {
-          50: "var(--brand-50)",
-          100: "var(--brand-100)",
-          500: "var(--brand-500)"
-        },
-        text: {
-          primary: "var(--text-primary)"
-        }
-      },
-      animation: {
-        marquee: "marquee var(--duration) linear infinite"
-      },
-      keyframes: {
-        marquee: {
-          from: { transform: "translateX(0)" },
-          to: { transform: "translateX(calc(-100% - var(--gap)))" }
-        }
-      }
-    }
-  }
-} satisfies Config`
+@theme {
+  --color-brand-500: oklch(0.72 0.18 150);
+}
+`
     );
 
     server = new NextDevServer(vfs, { port: 3001 });
@@ -1795,13 +1757,9 @@ export default {
     expect(response.statusCode).toBe(200);
     const html = response.body.toString();
 
-    // All config parts should be present
-    expect(html).toContain('darkMode');
-    expect(html).toContain('fontFamily');
-    expect(html).toContain('animation');
-    expect(html).toContain('keyframes');
-    expect(html).toContain('marquee');
-    expect(html).toContain('translateX');
+    expect(html).toContain('/__virtual__/3001/app/globals.css');
+    expect(html).not.toContain('cdn.tailwindcss.com');
+    expect(html).not.toContain('tailwind.config');
   });
 });
 

@@ -5,6 +5,7 @@
  */
 
 const DEBUG = false;
+const REQUEST_TIMEOUT_MS = 120000;
 
 // Communication port with main thread
 let mainPort = null;
@@ -165,13 +166,14 @@ async function sendRequest(port, method, url, headers, body) {
   return new Promise((resolve, reject) => {
     pendingRequests.set(id, { resolve, reject });
 
-    // Set timeout for request
+    // Set timeout for request. Cold browser-side Next/Vite transforms can take
+    // longer than 30s before the first document response is ready.
     setTimeout(() => {
       if (pendingRequests.has(id)) {
         pendingRequests.delete(id);
         reject(new Error('Request timeout'));
       }
-    }, 30000);
+    }, REQUEST_TIMEOUT_MS);
 
     mainPort.postMessage({
       type: 'request',

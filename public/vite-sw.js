@@ -5,6 +5,7 @@
 
 const VITE_ORIGIN = self.location.origin;
 const CACHE_NAME = 'vite-sw-v1';
+const REQUEST_TIMEOUT_MS = 120000;
 
 // Map of pending requests
 const pendingRequests = new Map();
@@ -94,13 +95,13 @@ async function handleViteRequest(request, url) {
   const responsePromise = new Promise((resolve, reject) => {
     pendingRequests.set(reqId, { resolve, reject });
 
-    // Timeout after 30 seconds
+    // Timeout after 120 seconds to allow cold browser-side transforms to finish.
     setTimeout(() => {
       if (pendingRequests.has(reqId)) {
         pendingRequests.delete(reqId);
         reject(new Error('Request timeout'));
       }
-    }, 30000);
+    }, REQUEST_TIMEOUT_MS);
   });
 
   // Send request to main thread

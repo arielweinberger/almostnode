@@ -11,6 +11,8 @@ export interface PackageVersion {
   peerDependencies?: Record<string, string>;
   peerDependenciesMeta?: Record<string, { optional?: boolean }>;
   optionalDependencies?: Record<string, string>;
+  os?: string | string[];
+  cpu?: string | string[];
   dist: {
     tarball: string;
     shasum: string;

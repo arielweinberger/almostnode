@@ -7,6 +7,7 @@
 
 import * as acorn from 'acorn';
 import { ROLLUP_BROWSER_CDN, ROLLUP_BROWSER_VERSION } from '../config/cdn';
+import { importExternalModule } from '../utils/external-import';
 
 // Rollup instance loaded from CDN
 let rollupInstance: unknown = null;
@@ -22,10 +23,7 @@ async function loadRollup(): Promise<unknown> {
   loadPromise = (async () => {
     try {
       // Load @rollup/browser from CDN
-      const rollup = await import(
-        /* @vite-ignore */
-        ROLLUP_BROWSER_CDN
-      );
+      const rollup = await importExternalModule<unknown>(ROLLUP_BROWSER_CDN);
       rollupInstance = rollup;
       console.log('[rollup] Browser version loaded');
       return rollup;

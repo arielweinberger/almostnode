@@ -81,7 +81,7 @@ export function createVfsRequire(
       } catch { /* ignore */ }
     }
     // Try extensions commonly used by packages and config files.
-    for (const ext of ['.js', '.mjs', '.cjs', '.json']) {
+    for (const ext of ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json']) {
       const withExt = basePath + ext;
       if (vfs.existsSync(withExt)) return withExt;
     }

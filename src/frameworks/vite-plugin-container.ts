@@ -3,6 +3,7 @@ import { simpleHash } from '../utils/hash';
 import { createFsShim } from '../shims/fs';
 import { createBuiltinModules } from './next-api-handler';
 import { createVfsRequire, VfsModule } from './vfs-require';
+import { createTailwindOxideShim } from './tailwind-oxide-shim';
 
 type ViteUserConfig = {
   plugins?: VitePluginInput;
@@ -12,7 +13,9 @@ type ViteUserConfig = {
 
 type VitePluginInput = VitePlugin | VitePluginInput[] | false | null | undefined;
 
-type Hook<T extends (...args: any[]) => any> = T | { handler: T };
+type ViteHookFunction = (...args: never[]) => unknown;
+
+type Hook<T extends ViteHookFunction> = T | { handler: T };
 
 type VitePlugin = {
   name?: string;
@@ -70,7 +73,7 @@ function interopDefault(value: unknown): unknown {
   return value;
 }
 
-function getHook<T extends (...args: any[]) => any>(hook: Hook<T> | undefined): T | undefined {
+function getHook<T extends ViteHookFunction>(hook: Hook<T> | undefined): T | undefined {
   if (!hook) return undefined;
   return typeof hook === 'function' ? hook : hook.handler;
 }
@@ -264,7 +267,7 @@ export class VitePluginContainer {
     if (builtinModules.fs && typeof builtinModules.fs === 'object' && 'promises' in builtinModules.fs) {
       builtinModules['fs/promises'] = (builtinModules.fs as { promises: unknown }).promises;
     }
-    builtinModules['@tailwindcss/oxide'] = this.createOxideShim();
+    builtinModules['@tailwindcss/oxide'] = createTailwindOxideShim(this.vfs, (path) => this.normalizePath(path));
     builtinModules.vite = {
       defineConfig: (config: unknown) => config,
       createIdResolver: () => async (environment: unknown, id: string, importer?: string) => {
@@ -400,64 +403,4 @@ export class VitePluginContainer {
     return `/${parts.join('/')}`;
   }
 
-  private createOxideShim(): { Scanner: new (options: { sources?: Array<{ base?: string; pattern?: string; negated?: boolean }> }) => unknown } {
-    const vfs = this.vfs;
-    const normalize = (path: string) => this.normalizePath(path);
-
-    class Scanner {
-      files: string[] = [];
-      globs: Array<{ base: string; pattern: string; negated?: boolean }> = [];
-      private sources: Array<{ base: string; pattern: string; negated?: boolean }>;
-
-      constructor(options: { sources?: Array<{ base?: string; pattern?: string; negated?: boolean }> } = {}) {
-        this.sources = (options.sources || [])
-          .filter((source) => !source.negated)
-          .map((source) => ({
-            base: normalize(source.base || '/'),
-            pattern: source.pattern || '**/*',
-            negated: source.negated,
-          }));
-        this.globs = this.sources;
-      }
-
-      scan(): string[] {
-        const candidates = new Set<string>();
-        this.files = [];
-
-        for (const source of this.sources) {
-          this.scanPath(source.base, candidates);
-        }
-
-        return [...candidates];
-      }
-
-      private scanPath(path: string, candidates: Set<string>): void {
-        if (!vfs.existsSync(path)) return;
-
-        const stats = vfs.statSync(path);
-        if (stats.isDirectory()) {
-          for (const entry of vfs.readdirSync(path)) {
-            if (entry === 'node_modules' || entry === '.git') continue;
-            this.scanPath(normalize(`${path}/${entry}`), candidates);
-          }
-          return;
-        }
-
-        if (!/\.(html|js|jsx|ts|tsx|vue|svelte|mdx?|css)$/.test(path)) {
-          return;
-        }
-
-        this.files.push(path);
-        const content = vfs.readFileSync(path, 'utf8');
-        for (const match of content.matchAll(/[A-Za-z0-9_:/!.[\]()%#-]+/g)) {
-          const candidate = match[0];
-          if (candidate && /[A-Za-z]/.test(candidate)) {
-            candidates.add(candidate);
-          }
-        }
-      }
-    }
-
-    return { Scanner };
-  }
 }

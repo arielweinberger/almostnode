@@ -7,6 +7,7 @@
 
 import { VirtualFS } from './virtual-fs';
 import { ESBUILD_WASM_ESM_CDN, ESBUILD_WASM_BINARY_CDN } from './config/cdn';
+import { importExternalModule } from './utils/external-import';
 
 // Check if we're in a browser environment
 const isBrowser = typeof window !== 'undefined';
@@ -39,10 +40,11 @@ export async function initTransformer(): Promise<void> {
       console.log('[transform] Loading esbuild-wasm...');
 
       // Load esbuild-wasm from CDN
-      const mod = await import(
-        /* @vite-ignore */
-        ESBUILD_WASM_ESM_CDN
-      );
+      const mod = await importExternalModule<
+        typeof import('esbuild-wasm') & {
+          default?: typeof import('esbuild-wasm');
+        }
+      >(ESBUILD_WASM_ESM_CDN);
 
       // esm.sh wraps the module - get the actual esbuild object
       const esbuildMod = mod.default || mod;

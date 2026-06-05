@@ -10,6 +10,7 @@ import { simpleHash } from '../utils/hash';
 import { addReactRefresh as _addReactRefresh } from './code-transforms';
 import { ESBUILD_WASM_ESM_CDN, ESBUILD_WASM_BINARY_CDN, REACT_REFRESH_CDN, REACT_CDN, REACT_DOM_CDN } from '../config/cdn';
 import { VitePluginContainer } from './vite-plugin-container';
+import { importExternalModule } from '../utils/external-import';
 
 // Check if we're in a real browser environment (not jsdom or Node.js)
 // jsdom has window but doesn't have ServiceWorker or SharedArrayBuffer
@@ -38,10 +39,11 @@ async function initEsbuild(): Promise<void> {
 
   window.__esbuildInitPromise = (async () => {
     try {
-      const mod = await import(
-        /* @vite-ignore */
-        ESBUILD_WASM_ESM_CDN
-      );
+      const mod = await importExternalModule<
+        typeof import('esbuild-wasm') & {
+          default?: typeof import('esbuild-wasm');
+        }
+      >(ESBUILD_WASM_ESM_CDN);
 
       const esbuildMod = mod.default || mod;
 
@@ -551,39 +553,51 @@ export class ViteDevServer extends DevServer {
   /**
    * Handle file change event
    */
+  notifyFileChanged(path: string): void {
+    this.handleFileChange(path.startsWith('/') ? path : `/${path}`);
+  }
+
   private handleFileChange(path: string): void {
     this.transformCache.delete(path);
     this.cssTransformCache.delete(path);
 
+    const isCSS = path.endsWith('.css');
+    const isJS = /\.(jsx?|tsx?)$/.test(path);
+    const isContentFile = isJS || /\.(html|mdx?)$/.test(path);
+
+    if (
+      isCSS ||
+      isContentFile ||
+      /\/vite\.config\.(js|mjs|ts)$/.test(path) ||
+      path.endsWith('/package.json')
+    ) {
+      this.cssTransformCache.clear();
+    }
+
     if (/\/vite\.config\.(js|mjs|ts)$/.test(path)) {
       this.pluginContainer.invalidate();
-      this.cssTransformCache.clear();
+    }
+
+    if (!isCSS && isContentFile) {
+      for (const cssPath of this.getCompiledTailwindCssPaths()) {
+        this.sendHMRUpdate({
+          type: 'update',
+          path: cssPath,
+          timestamp: Date.now(),
+        });
+      }
     }
 
     // Determine update type:
     // - CSS and JS/JSX/TSX files: 'update' (handled by HMR client)
     // - Other files: 'full-reload'
-    const isCSS = path.endsWith('.css');
-    const isJS = /\.(jsx?|tsx?)$/.test(path);
     const updateType = (isCSS || isJS) ? 'update' : 'full-reload';
 
-    const update: HMRUpdate = {
+    this.sendHMRUpdate({
       type: updateType,
       path,
       timestamp: Date.now(),
-    };
-
-    // Emit event for ServerBridge
-    this.emitHMRUpdate(update);
-
-    // Send HMR update via postMessage (works with sandboxed iframes)
-    if (this.hmrTargetWindow) {
-      try {
-        this.hmrTargetWindow.postMessage({ ...update, channel: 'vite-hmr' }, '*');
-      } catch (e) {
-        // Window may be closed or unavailable
-      }
-    }
+    });
   }
 
   /**
@@ -810,6 +824,45 @@ export default css;
     const code = rewriteCssRootUrls(transformed, filePath);
     this.cssTransformCache.set(filePath, { code, hash });
     return code;
+  }
+
+  private getCompiledTailwindCssPaths(): string[] {
+    const paths: string[] = [];
+
+    const walk = (dir: string): void => {
+      if (!this.exists(dir) || !this.isDirectory(dir)) return;
+
+      for (const entry of this.vfs.readdirSync(dir) as string[]) {
+        if (entry === 'node_modules' || entry === '.git') continue;
+
+        const fullPath = dir === '/' ? `/${entry}` : `${dir}/${entry}`;
+        if (this.isDirectory(fullPath)) {
+          walk(fullPath);
+          continue;
+        }
+
+        if (!fullPath.endsWith('.css')) continue;
+        const cssFile = this.vfs.readFileSync(fullPath, 'utf8');
+        if (/@import\s+["']tailwindcss["']/.test(cssFile)) {
+          paths.push(fullPath);
+        }
+      }
+    };
+
+    walk(this.root);
+    return paths;
+  }
+
+  private sendHMRUpdate(update: HMRUpdate): void {
+    this.emitHMRUpdate(update);
+
+    if (this.hmrTargetWindow) {
+      try {
+        this.hmrTargetWindow.postMessage({ ...update, channel: 'vite-hmr' }, '*');
+      } catch {
+        // Window may be closed or unavailable.
+      }
+    }
   }
 
   /**

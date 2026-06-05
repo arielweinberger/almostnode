@@ -76,6 +76,7 @@ export default defineConfig({
         main: resolve(__dirname, 'index.html'),
         'examples/index': resolve(__dirname, 'examples/index.html'),
         'examples/next-demo': resolve(__dirname, 'examples/next-demo.html'),
+        'examples/next-tailwind-demo': resolve(__dirname, 'examples/next-tailwind-demo.html'),
         'examples/vite-demo': resolve(__dirname, 'examples/vite-demo.html'),
         'examples/express-demo': resolve(__dirname, 'examples/express-demo.html'),
         'examples/npm-scripts-demo': resolve(__dirname, 'examples/npm-scripts-demo.html'),

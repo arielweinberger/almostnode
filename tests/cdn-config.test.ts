@@ -11,7 +11,6 @@ import {
   ESBUILD_WASM_BINARY_CDN,
   ESBUILD_WASM_BROWSER_CDN,
   ROLLUP_BROWSER_CDN,
-  TAILWIND_CDN_URL,
 } from '../src/config/cdn';
 
 describe('CDN config', () => {
@@ -57,12 +56,6 @@ describe('CDN config', () => {
     it('ROLLUP_BROWSER_CDN includes ROLLUP_BROWSER_VERSION', () => {
       expect(ROLLUP_BROWSER_CDN).toContain(ROLLUP_BROWSER_VERSION);
       expect(ROLLUP_BROWSER_CDN).toMatch(/^https:\/\/esm\.sh\/@rollup\/browser@/);
-    });
-  });
-
-  describe('no hardcoded URLs leak into platform code', () => {
-    it('TAILWIND_CDN_URL is a valid URL', () => {
-      expect(TAILWIND_CDN_URL).toMatch(/^https:\/\//);
     });
   });
 });

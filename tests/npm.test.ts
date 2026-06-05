@@ -5,6 +5,7 @@ import {
   compareVersions,
   satisfies,
   findBestVersion,
+  resolveFromPackageJson,
 } from '../src/npm/resolver';
 import { extractTarball, decompress } from '../src/npm/tarball';
 import { parsePackageSpec, PackageManager } from '../src/npm';
@@ -144,6 +145,127 @@ describe('npm', () => {
       it('should return null if no match', () => {
         expect(findBestVersion(versions, '^3.0.0')).toBeNull();
       });
+    });
+  });
+
+  describe('browser optional dependency resolution', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('should skip native-only optional packages and keep browser-compatible optionals', async () => {
+      const manifests = {
+        'oxide-host': {
+          name: 'oxide-host',
+          'dist-tags': { latest: '1.0.0' },
+          versions: {
+            '1.0.0': {
+              name: 'oxide-host',
+              version: '1.0.0',
+              dist: {
+                tarball:
+                  'https://registry.npmjs.org/oxide-host/-/oxide-host-1.0.0.tgz',
+                shasum: 'host',
+              },
+              optionalDependencies: {
+                'oxide-darwin-arm64': '1.0.0',
+                'oxide-linux-x64': '1.0.0',
+                'oxide-wasm32-wasi': '1.0.0',
+                'portable-helper': '1.0.0',
+              },
+            },
+          },
+        },
+        'oxide-darwin-arm64': {
+          name: 'oxide-darwin-arm64',
+          'dist-tags': { latest: '1.0.0' },
+          versions: {
+            '1.0.0': {
+              name: 'oxide-darwin-arm64',
+              version: '1.0.0',
+              os: ['darwin'],
+              cpu: ['arm64'],
+              dist: {
+                tarball:
+                  'https://registry.npmjs.org/oxide-darwin-arm64/-/oxide-darwin-arm64-1.0.0.tgz',
+                shasum: 'darwin',
+              },
+            },
+          },
+        },
+        'oxide-linux-x64': {
+          name: 'oxide-linux-x64',
+          'dist-tags': { latest: '1.0.0' },
+          versions: {
+            '1.0.0': {
+              name: 'oxide-linux-x64',
+              version: '1.0.0',
+              os: ['linux'],
+              cpu: ['x64'],
+              dist: {
+                tarball:
+                  'https://registry.npmjs.org/oxide-linux-x64/-/oxide-linux-x64-1.0.0.tgz',
+                shasum: 'linux',
+              },
+            },
+          },
+        },
+        'oxide-wasm32-wasi': {
+          name: 'oxide-wasm32-wasi',
+          'dist-tags': { latest: '1.0.0' },
+          versions: {
+            '1.0.0': {
+              name: 'oxide-wasm32-wasi',
+              version: '1.0.0',
+              cpu: ['none'],
+              dist: {
+                tarball:
+                  'https://registry.npmjs.org/oxide-wasm32-wasi/-/oxide-wasm32-wasi-1.0.0.tgz',
+                shasum: 'wasm',
+              },
+            },
+          },
+        },
+        'portable-helper': {
+          name: 'portable-helper',
+          'dist-tags': { latest: '1.0.0' },
+          versions: {
+            '1.0.0': {
+              name: 'portable-helper',
+              version: '1.0.0',
+              dist: {
+                tarball:
+                  'https://registry.npmjs.org/portable-helper/-/portable-helper-1.0.0.tgz',
+                shasum: 'portable',
+              },
+            },
+          },
+        },
+      };
+
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+        const packageName = url.toString().split('/').pop();
+        const manifest = Object.entries(manifests).find(
+          ([name]) => name === packageName
+        )?.[1];
+
+        if (manifest) {
+          return new Response(JSON.stringify(manifest), { status: 200 });
+        }
+
+        return new Response('Not found', { status: 404 });
+      });
+
+      const resolved = await resolveFromPackageJson(
+        { dependencies: { 'oxide-host': '1.0.0' } },
+        { includeOptional: true }
+      );
+
+      expect([...resolved.keys()].sort()).toEqual([
+        'oxide-host',
+        'oxide-wasm32-wasi',
+        'portable-helper',
+      ]);
     });
   });
 

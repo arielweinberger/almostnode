@@ -99,6 +99,15 @@ export abstract class DevServer extends EventEmitter {
   abstract startWatching(): void;
 
   /**
+   * Notify the dev server that a file changed outside its watcher path.
+   * Browser hosts that own their editor can call this immediately after
+   * writing to the VFS so HMR is not dependent on watcher delivery.
+   */
+  notifyFileChanged(_path: string): void {
+    // Framework servers override this when they support HMR updates.
+  }
+
+  /**
    * Stop the server and cleanup
    */
   stop(): void {
