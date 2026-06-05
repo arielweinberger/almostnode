@@ -587,10 +587,17 @@ function createRequire(
       if (pkg) {
         // Use resolve.exports to handle the exports field
         if (pkg.exports) {
-          // Try require first, then import. Some packages have broken ESM builds (convex).
+          // Prefer browser entries because this runtime executes in the browser.
+          // Keep require before import after that; some packages have broken ESM
+          // builds (convex), and the loader can still retry import for CJS stubs.
           // If the CJS entry throws "cannot be imported with require()", the loadModule
           // fallback will retry with the import condition.
-          for (const conditions of [{ require: true }, { import: true }] as const) {
+          for (const conditions of [
+            { browser: true, require: true },
+            { browser: true, import: true },
+            { require: true },
+            { import: true },
+          ] as const) {
             try {
               const resolved = resolveExports(pkg, moduleId, conditions);
               if (resolved && resolved.length > 0) {

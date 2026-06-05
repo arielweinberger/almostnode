@@ -53,10 +53,12 @@ export function initNpmServe(vfs: VirtualFS): void {
  *   { "import": { "types": "...", "import": "./dist/esm/server/index.js" },
  *     "require": { "types": "...", "require": "./dist/cjs/server/index.js" } }
  *
- * Prefers require > import > module > default (CJS-first to avoid .mjs issues).
+ * Prefers browser > require > import > module > default. Browser-served npm
+ * bundles must honor package browser exports; otherwise browser-safe packages
+ * such as @vercel/oidc fall back to Node-only entries.
  * Skips 'types' condition (resolves to .d.ts files).
  */
-const CJS_CONDITION_PRIORITY = ['require', 'import', 'module', 'default'] as const;
+const CJS_CONDITION_PRIORITY = ['browser', 'require', 'import', 'module', 'default'] as const;
 
 function resolveExportEntry(entry: unknown): string | undefined {
   if (typeof entry === 'string') return entry;

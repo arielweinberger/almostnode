@@ -131,15 +131,17 @@ export interface BuildResult {
  * The priority order for export conditions when resolving package exports.
  *
  * Order rationale:
- * 1. "module" - ESM entry point (preferred for modern bundlers)
- * 2. "import" - ESM import condition (standard Node.js condition)
- * 3. "require" - CJS require condition (fallback for CommonJS)
- * 4. "default" - Fallback condition (lowest priority)
+ * 1. "browser" - Browser-safe entry point (required for packages that ship
+ *    server and browser variants behind package exports)
+ * 2. "module" - ESM entry point (preferred for modern bundlers)
+ * 3. "import" - ESM import condition (standard Node.js condition)
+ * 4. "require" - CJS require condition (fallback for CommonJS)
+ * 5. "default" - Fallback condition (lowest priority)
  *
  * Packages with custom conditions (e.g. "convex", "react-native") will
  * fall through to one of these standard conditions.
  */
-const EXPORT_CONDITION_PRIORITY = ['module', 'import', 'require', 'default'] as const;
+const EXPORT_CONDITION_PRIORITY = ['browser', 'module', 'import', 'require', 'default'] as const;
 
 /**
  * Resolves a package.json exports entry to a file path by evaluating export conditions.
@@ -366,14 +368,16 @@ function resolveSubpathImport(
  *
  * Resolution order:
  * 1. Check exports map "." key with condition resolution
- * 2. Fall back to "module" field (ESM entry)
- * 3. Fall back to "main" field (CJS entry)
- * 4. Default to "index.js"
+ * 2. Fall back to "browser" field (browser entry)
+ * 3. Fall back to "module" field (ESM entry)
+ * 4. Fall back to "main" field (CJS entry)
+ * 5. Default to "index.js"
  */
 function resolveMainImport(
   vfs: VirtualFS,
   packageJson: {
     exports?: Record<string, ExportEntry> | ExportEntry;
+    browser?: string | Record<string, string | false>;
     module?: string;
     main?: string;
   },
@@ -397,9 +401,10 @@ function resolveMainImport(
     }
   }
 
-  // Fall back to module/main fields
-  // Prefer "module" (ESM) over "main" (CJS) for better tree-shaking
-  const mainField = packageJson.module || packageJson.main || 'index.js';
+  // Fall back to browser/module/main fields.
+  // Prefer browser-safe entries when a package provides a root browser field.
+  const browserField = typeof packageJson.browser === 'string' ? packageJson.browser : undefined;
+  const mainField = browserField || packageJson.module || packageJson.main || 'index.js';
   const resolvedPath = nodeModulesBase + '/' + mainField.replace(/^\.\//, '');
   return findVFSFile(vfs, resolvedPath, extensions);
 }
