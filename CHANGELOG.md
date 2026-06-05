@@ -8,8 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-06-05
 
 ### Added
-- **Start.dev scoped package**: Renamed the npm package to `@startdev/almostnode` with public publish metadata for the maintained Start.dev fork.
-- **Browser runtime export**: Added `@startdev/almostnode/browser-runtime` for browser-local integrations that need the VFS, package manager, and dev server APIs without server-only helpers.
+- **Start.dev scoped package**: Renamed the npm package to `@start.dev/almostnode` with public publish metadata for the maintained Start.dev fork.
+- **Browser runtime export**: Added `@start.dev/almostnode/browser-runtime` for browser-local integrations that need the VFS, package manager, and dev server APIs without server-only helpers.
 - **Next.js + Tailwind v4 support**: Added browser-side CSS processing for conventional Next.js global CSS, PostCSS, and Tailwind v4 package setups.
 - **Persistent package install cache**: npm package installs now cache extracted/transformed package directories in IndexedDB so hard reloads can restore packages without downloading tarballs again.
 - **Next + Tailwind v4 demo and E2E coverage**: Added a focused demo page and Playwright coverage for the Next.js/Tailwind runtime path.
