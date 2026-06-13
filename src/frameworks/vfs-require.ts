@@ -11,9 +11,12 @@
  */
 
 import { VirtualFS } from '../virtual-fs';
-import { resolve as resolveExports } from 'resolve.exports';
+import {
+  imports as resolveImports,
+  resolve as resolveExports,
+} from 'resolve.exports';
 import * as pathShim from '../shims/path';
-import { transformEsmToCjsSimple } from './code-transforms';
+import { transformDynamicImportsToRequire, transformEsmToCjsSimple } from './code-transforms';
 import type { PackageJson } from '../types/package-json';
 
 export interface VfsModule {
@@ -67,6 +70,66 @@ export function createVfsRequire(
     }
   }
 
+  function getPackageRoot(filePath: string): string | null {
+    const marker = '/node_modules/';
+    const markerIndex = filePath.lastIndexOf(marker);
+    if (markerIndex < 0) return null;
+
+    const rootPrefix = filePath.slice(0, markerIndex + marker.length);
+    const packagePath = filePath.slice(markerIndex + marker.length);
+    const parts = packagePath.split('/');
+    if (parts.length === 0 || !parts[0]) return null;
+
+    if (parts[0].startsWith('@')) {
+      if (!parts[1]) return null;
+      return `${rootPrefix}${parts[0]}/${parts[1]}`;
+    }
+
+    return `${rootPrefix}${parts[0]}`;
+  }
+
+  function getNearestPackage(currentDir: string): { root: string; pkg: PackageJson } | null {
+    let searchDir = currentDir;
+    while (true) {
+      const pkgPath = pathShim.join(searchDir, 'package.json');
+      const pkg = getParsedPackageJson(pkgPath);
+      if (pkg) return { root: searchDir, pkg };
+
+      const parent = pathShim.dirname(searchDir);
+      if (parent === searchDir) break;
+      searchDir = parent;
+    }
+
+    return null;
+  }
+
+  function isCommonJsPackageFile(filePath: string): boolean {
+    if (filePath.endsWith('.cjs')) return true;
+    if (filePath.endsWith('.mjs')) return false;
+
+    const packageRoot = getPackageRoot(filePath);
+    if (!packageRoot) return false;
+
+    const pkg = getParsedPackageJson(pathShim.join(packageRoot, 'package.json'));
+    return pkg?.type !== 'module';
+  }
+
+  function addCommonJsDefaultInterop(exportsValue: unknown, filePath: string): unknown {
+    if (!isCommonJsPackageFile(filePath)) return exportsValue;
+    if (exportsValue === null) return exportsValue;
+    if (typeof exportsValue !== 'object' && typeof exportsValue !== 'function') return exportsValue;
+    if (Object.prototype.hasOwnProperty.call(exportsValue, 'default')) return exportsValue;
+    if (!Object.isExtensible(exportsValue)) return exportsValue;
+
+    Object.defineProperty(exportsValue, 'default', {
+      configurable: true,
+      enumerable: false,
+      value: exportsValue,
+    });
+
+    return exportsValue;
+  }
+
   // ── Resolution ──
 
   function tryResolveFile(basePath: string): string | null {
@@ -101,9 +164,14 @@ export function createVfsRequire(
     if (pkg) {
       // Use resolve.exports to handle the exports field
       if (pkg.exports) {
+        const exportSubpath =
+          pkgName === moduleId
+            ? '.'
+            : `.${moduleId.slice(pkgName.length)}`;
+
         for (const conditions of [{ require: true }, { import: true }] as const) {
           try {
-            const resolved = resolveExports(pkg, moduleId, conditions);
+            const resolved = resolveExports(pkg, exportSubpath, conditions);
             if (resolved && resolved.length > 0) {
               const fullExportPath = pathShim.join(pkgRoot, resolved[0]);
               const resolvedFile = tryResolveFile(fullExportPath);
@@ -125,8 +193,8 @@ export function createVfsRequire(
       // If root import (no sub-path), use browser/module/main
       if (pkgName === moduleId) {
         let main: string | undefined;
-        main = pkg.main || (pkg.module as string | undefined);
-        if (!main && typeof pkg.browser === 'string') main = pkg.browser;
+        if (typeof pkg.browser === 'string') main = pkg.browser;
+        if (!main) main = (pkg.module as string | undefined) || pkg.main;
         if (!main) main = 'index.js';
         const resolvedMain = tryResolveFile(pathShim.join(pkgRoot, main));
         if (resolvedMain) return resolvedMain;
@@ -138,13 +206,54 @@ export function createVfsRequire(
     return tryResolveFile(fullPath);
   }
 
+  function tryResolvePackageImport(moduleId: string, currentDir: string): string | null {
+    if (!moduleId.startsWith('#')) return null;
+
+    const nearestPackage = getNearestPackage(currentDir);
+    if (!nearestPackage || !nearestPackage.pkg.imports) return null;
+
+    for (const conditions of [{ require: true }, { import: true }] as const) {
+      try {
+        const resolved = resolveImports(nearestPackage.pkg, moduleId, conditions);
+        if (!resolved || resolved.length === 0) continue;
+
+        for (const target of resolved) {
+          if (target.startsWith('.')) {
+            const resolvedFile = tryResolveFile(pathShim.join(nearestPackage.root, target));
+            if (resolvedFile) return resolvedFile;
+            continue;
+          }
+
+          try {
+            return resolveModule(target, currentDir);
+          } catch {
+            // Try the next import target or condition.
+          }
+        }
+      } catch {
+        // resolveImports throws for missing entries or unmatched conditions.
+      }
+    }
+
+    return null;
+  }
+
   function resolveModule(id: string, currentDir: string): string {
     // Relative or absolute path
-    if (id.startsWith('./') || id.startsWith('../') || id.startsWith('/')) {
+    if (
+      id === '.' ||
+      id === '..' ||
+      id.startsWith('./') ||
+      id.startsWith('../') ||
+      id.startsWith('/')
+    ) {
       const resolved = tryResolveFile(pathShim.resolve(currentDir, id));
       if (resolved) return resolved;
       throw new Error(`Cannot find module '${id}'`);
     }
+
+    const imported = tryResolvePackageImport(id, currentDir);
+    if (imported) return imported;
 
     // Walk up directories looking for node_modules
     let searchDir = currentDir;
@@ -163,6 +272,63 @@ export function createVfsRequire(
     if (rootResolved) return rootResolved;
 
     throw new Error(`Cannot find module '${id}'`);
+  }
+
+  function createDynamicImport(moduleRequire: (id: string) => unknown): (specifier: string) => Promise<unknown> {
+    return async (specifier: string): Promise<unknown> => {
+      const loaded = moduleRequire(specifier);
+
+      if (
+        loaded &&
+        typeof loaded === 'object' &&
+        ('default' in loaded || '__esModule' in loaded)
+      ) {
+        return loaded;
+      }
+
+      return {
+        default: loaded,
+        ...(loaded && typeof loaded === 'object' ? loaded : {}),
+      };
+    };
+  }
+
+  function declaresBinding(code: string, name: string): boolean {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const declaration = new RegExp(`\\b(?:const|let|var|function|class)\\s+${escapedName}\\b`, 'g');
+    let match = declaration.exec(code);
+    while (match) {
+      let braceDepth = 0;
+      for (let index = 0; index < match.index; index++) {
+        if (code[index] === '{') braceDepth++;
+        if (code[index] === '}') braceDepth--;
+      }
+      if (braceDepth === 0) return true;
+      match = declaration.exec(code);
+    }
+    return false;
+  }
+
+  function injectCommonJsBindings(code: string): string {
+    const bindings: Array<[string, string]> = [
+      ['exports', '__vfsExports'],
+      ['require', '__vfsRequire'],
+      ['module', '__vfsModule'],
+      ['__filename', '__vfsFilename'],
+      ['__dirname', '__vfsDirname'],
+      ['process', '__vfsProcess'],
+      ['__dynamicImport', '__vfsDynamicImport'],
+    ];
+    const prelude = bindings
+      .filter(([name]) => !declaresBinding(code, name))
+      .map(([name, source]) => `let ${name} = ${source};`)
+      .join('\n');
+
+    if (!prelude) return code;
+
+    const directiveMatch = /^(?:\s*(?:"use strict"|'use strict');?\s*)+/.exec(code);
+    const insertAt = directiveMatch ? directiveMatch[0].length : 0;
+    return `${code.slice(0, insertAt)}${prelude}\n${code.slice(insertAt)}`;
   }
 
   // ── Loading ──
@@ -208,25 +374,38 @@ export function createVfsRequire(
         code = transformEsmToCjsSimple(code);
       }
     }
-    code = code
+    code = transformDynamicImportsToRequire(code)
       .replace(/\bimport\.meta\.url\b/g, JSON.stringify(`file://${resolvedPath}`))
       .replace(/\bimport\.meta\.filename\b/g, JSON.stringify(resolvedPath))
       .replace(/\bimport\.meta\.dirname\b/g, JSON.stringify(dirname));
+    const importMeta = {
+      url: `file://${resolvedPath}`,
+      filename: resolvedPath,
+      dirname,
+    };
 
     // Create require scoped to this module's directory
     const moduleRequire = (id: string) => requireFn(id, dirname);
+    const dynamicImport = createDynamicImport(moduleRequire);
 
     // Execute module code
     try {
       const moduleObj = { exports: mod.exports as Record<string, unknown> };
       const fn = new Function(
-        'exports', 'require', 'module', '__filename', '__dirname', 'process',
-        code,
+        '__vfsExports',
+        '__vfsRequire',
+        '__vfsModule',
+        '__vfsFilename',
+        '__vfsDirname',
+        '__vfsProcess',
+        'import_meta',
+        '__vfsDynamicImport',
+        injectCommonJsBindings(code),
       );
-      fn(moduleObj.exports, moduleRequire, moduleObj, resolvedPath, dirname, process);
+      fn(moduleObj.exports, moduleRequire, moduleObj, resolvedPath, dirname, process, importMeta, dynamicImport);
 
       // Update exports (module.exports may have been reassigned)
-      mod.exports = moduleObj.exports;
+      mod.exports = addCommonJsDefaultInterop(moduleObj.exports, resolvedPath);
       mod.loaded = true;
     } catch (error) {
       delete moduleCache[resolvedPath];

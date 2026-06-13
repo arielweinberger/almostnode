@@ -1,7 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { VirtualFS } from '../src/virtual-fs';
 import { createVfsRequire } from '../src/frameworks/vfs-require';
-import { executeApiHandler, createMockRequest, createMockResponse } from '../src/frameworks/next-api-handler';
+import {
+  createBuiltinModules,
+  createMockRequest,
+  createMockResponse,
+  executeApiHandler,
+} from '../src/frameworks/next-api-handler';
+import { createFsShim } from '../src/shims/fs';
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
@@ -63,6 +69,60 @@ describe('VFS require — resolution', () => {
 
     const { require } = createRequire(vfs);
     expect(require('exports-pkg')).toBe('from-exports');
+  });
+
+  it('resolves package exports when installed under an npm alias name', () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/h3-v2/dist', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/h3-v2/package.json',
+      JSON.stringify({
+        name: 'h3',
+        exports: {
+          '.': {
+            import: './dist/index.mjs',
+          },
+        },
+      })
+    );
+    vfs.writeFileSync('/node_modules/h3-v2/dist/index.mjs', 'module.exports = "from-h3-alias";');
+
+    const { require } = createRequire(vfs);
+
+    expect(require('h3-v2')).toBe('from-h3-alias');
+  });
+
+  it('resolves package imports for package-scoped hash specifiers', () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/start-server-core/dist/esm', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/start-server-core/package.json',
+      JSON.stringify({
+        name: 'start-server-core',
+        imports: {
+          '#server-fn-resolver': {
+            default: './dist/esm/fake-server-fn-resolver.js',
+          },
+        },
+      })
+    );
+    vfs.writeFileSync(
+      '/node_modules/start-server-core/dist/esm/getServerFnById.js',
+      'const resolver = require("#server-fn-resolver"); module.exports = resolver.getServerFnById;',
+    );
+    vfs.writeFileSync(
+      '/node_modules/start-server-core/dist/esm/fake-server-fn-resolver.js',
+      'exports.getServerFnById = () => "fake-resolver";',
+    );
+
+    const { require } = createRequire(vfs);
+    const getServerFnById = require('start-server-core/dist/esm/getServerFnById');
+
+    expect(typeof getServerFnById).toBe('function');
+    if (typeof getServerFnById !== 'function') {
+      throw new Error('getServerFnById did not resolve to a function');
+    }
+    expect(getServerFnById()).toBe('fake-resolver');
   });
 
   it('resolves scoped packages (@scope/pkg)', () => {
@@ -153,6 +213,26 @@ describe('VFS require — resolution', () => {
 
     const { require } = createRequire(vfs);
     expect(require('dir-pkg')).toBe('from-index');
+  });
+
+  it('resolves literal same-directory dot requires', () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/dot-pkg/lib/builder', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/dot-pkg/package.json',
+      JSON.stringify({ name: 'dot-pkg', main: 'lib/builder/entry.js' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/dot-pkg/lib/builder/index.js',
+      'exports.createBuilder = () => "same-directory-index";',
+    );
+    vfs.writeFileSync(
+      '/node_modules/dot-pkg/lib/builder/entry.js',
+      'const builder = require("."); module.exports = builder.createBuilder();',
+    );
+
+    const { require } = createRequire(vfs);
+    expect(require('dot-pkg')).toBe('same-directory-index');
   });
 
   it('resolves browser field over main', () => {
@@ -283,6 +363,32 @@ describe('VFS require — loading', () => {
     expect(mod()).toBe('hi');
   });
 
+  it('rewrites import.meta in the ESM safety-net transform', () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/esm-import-meta-mod', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/esm-import-meta-mod/package.json',
+      JSON.stringify({ name: 'esm-import-meta-mod', main: 'index.js', type: 'module' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/esm-import-meta-mod/index.js',
+      `export const meta = import.meta;
+export const url = import.meta.url;`
+    );
+
+    const { require } = createRequire(vfs);
+    const mod = require('esm-import-meta-mod');
+
+    expect(mod).toEqual({
+      meta: {
+        url: 'file:///node_modules/esm-import-meta-mod/index.js',
+        filename: '/node_modules/esm-import-meta-mod/index.js',
+        dirname: '/node_modules/esm-import-meta-mod',
+      },
+      url: 'file:///node_modules/esm-import-meta-mod/index.js',
+    });
+  });
+
   it('provides __filename and __dirname to modules', () => {
     const vfs = setupVfs();
     vfs.mkdirSync('/node_modules/meta-mod', { recursive: true });
@@ -299,6 +405,128 @@ describe('VFS require — loading', () => {
     const mod = require('meta-mod') as any;
     expect(mod.file).toBe('/node_modules/meta-mod/index.js');
     expect(mod.dir).toBe('/node_modules/meta-mod');
+  });
+
+  it('lets transformed ESM packages declare CommonJS-like names', () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/esm-meta-mod', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/esm-meta-mod/package.json',
+      JSON.stringify({ name: 'esm-meta-mod', main: 'index.js' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/esm-meta-mod/index.js',
+      `const require = () => "local-require";
+const __filename = "local-file";
+const __dirname = "local-dir";
+module.exports = { required: require(), file: __filename, dir: __dirname };`
+    );
+
+    const { require } = createRequire(vfs);
+
+    expect(require('esm-meta-mod')).toEqual({
+      required: 'local-require',
+      file: 'local-file',
+      dir: 'local-dir',
+    });
+  });
+
+  it('provides import_meta to pre-transformed ESM packages', () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/import-meta-mod', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/import-meta-mod/package.json',
+      JSON.stringify({ name: 'import-meta-mod', main: 'index.js' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/import-meta-mod/index.js',
+      `module.exports = {
+        url: import_meta.url,
+        file: import_meta.filename,
+        dir: import_meta.dirname
+      };`
+    );
+
+    const { require } = createRequire(vfs);
+
+    expect(require('import-meta-mod')).toEqual({
+      url: 'file:///node_modules/import-meta-mod/index.js',
+      file: '/node_modules/import-meta-mod/index.js',
+      dir: '/node_modules/import-meta-mod',
+    });
+  });
+
+  it('adds Node-style default interop for CommonJS packages with __esModule', () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/@babel/core', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/@babel/core/package.json',
+      JSON.stringify({ name: '@babel/core', main: 'index.js', type: 'commonjs' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/@babel/core/index.js',
+      `Object.defineProperty(exports, "__esModule", { value: true });
+exports.template = {
+  expression: function expression() {
+    return "template-ok";
+  }
+};`
+    );
+    vfs.mkdirSync('/node_modules/esm-consumer', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/esm-consumer/package.json',
+      JSON.stringify({ name: 'esm-consumer', main: 'index.js', type: 'module' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/esm-consumer/index.js',
+      `var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __copyProps = (to, from, except, desc) => {
+  if (from && (typeof from === "object" || typeof from === "function")) {
+    for (let key of __getOwnPropNames(from)) {
+      if (!__hasOwnProp.call(to, key) && key !== except) {
+        __defProp(to, key, {
+          get: () => from[key],
+          enumerable: !(desc = Object.getOwnPropertyDescriptor(from, key)) || desc.enumerable
+        });
+      }
+    }
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (
+  target = mod != null ? Object.create(__getProtoOf(mod)) : {},
+  __copyProps(isNodeMode || !mod || !mod.__esModule
+    ? __defProp(target, "default", { value: mod, enumerable: true })
+    : target, mod)
+);
+var import_core = __toESM(require("@babel/core"));
+module.exports = import_core.default.template.expression();`
+    );
+
+    const { require } = createRequire(vfs);
+
+    expect(require('esm-consumer')).toBe('template-ok');
+  });
+
+  it('does not add default interop to non-extensible CommonJS exports', () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/frozen-mod', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/frozen-mod/package.json',
+      JSON.stringify({ name: 'frozen-mod', main: 'index.js' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/frozen-mod/index.js',
+      'module.exports = Object.freeze({ resolve: () => "ok" });'
+    );
+
+    const { require } = createRequire(vfs);
+    const mod = require('frozen-mod');
+
+    expect(mod).toEqual({ resolve: expect.any(Function) });
   });
 
   it('provides process object to modules', () => {
@@ -319,6 +547,62 @@ describe('VFS require — loading', () => {
     });
 
     expect(vfsRequire('env-mod')).toBe('hello-env');
+  });
+
+  it('keeps ESM dynamic imports inside the VFS require graph', async () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/dynamic-esm', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/dynamic-esm/package.json',
+      JSON.stringify({ name: 'dynamic-esm', main: 'index.js', type: 'module' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/dynamic-esm/index.js',
+      `export async function loadValue() {
+  const module = await import('./value.js');
+  return module.value;
+}`
+    );
+    vfs.writeFileSync('/node_modules/dynamic-esm/value.js', 'exports.value = "from-vfs";');
+
+    const { require } = createRequire(vfs);
+    const loaded = require('dynamic-esm');
+
+    if (!loaded || typeof loaded !== 'object' || !('loadValue' in loaded)) {
+      throw new Error('dynamic-esm did not export loadValue');
+    }
+    const loadValue = loaded.loadValue;
+    if (typeof loadValue !== 'function') {
+      throw new Error('dynamic-esm loadValue is not a function');
+    }
+
+    expect(await loadValue()).toBe('from-vfs');
+  });
+
+  it('keeps CJS dynamic imports inside the VFS require graph', async () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/dynamic-cjs', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/dynamic-cjs/package.json',
+      JSON.stringify({ name: 'dynamic-cjs', main: 'index.js' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/dynamic-cjs/index.js',
+      `module.exports = async function loadValue() {
+  const module = await import('./value.js');
+  return module.value;
+};`
+    );
+    vfs.writeFileSync('/node_modules/dynamic-cjs/value.js', 'exports.value = "from-vfs-cjs";');
+
+    const { require } = createRequire(vfs);
+    const loadValue = require('dynamic-cjs');
+
+    if (typeof loadValue !== 'function') {
+      throw new Error('dynamic-cjs did not export a function');
+    }
+
+    expect(await loadValue()).toBe('from-vfs-cjs');
   });
 });
 
@@ -345,6 +629,71 @@ describe('VFS require — builtins', () => {
     const vfs = setupVfs();
     const { require } = createRequire(vfs, '/', { fs: fakeFs });
     expect(require('node:fs')).toBe(fakeFs);
+  });
+
+  it('exposes node:assert as the callable Node default export', async () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/node_modules/assert-consumer', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/assert-consumer/package.json',
+      JSON.stringify({ name: 'assert-consumer', main: 'index.js', type: 'module' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/assert-consumer/index.js',
+      `import assert from 'node:assert';
+
+assert(true, 'default assert should be callable');
+export const ok = typeof assert === 'function';`
+    );
+
+    const builtins = await createBuiltinModules();
+    const { require } = createVfsRequire(vfs, '/', {
+      builtinModules: builtins,
+      process: { env: {}, cwd: () => '/' },
+    });
+
+    expect(require('assert-consumer')).toEqual({ ok: true });
+  });
+
+  it('lets resolver-style packages probe extensionless VFS files', async () => {
+    const vfs = setupVfs();
+    vfs.mkdirSync('/src', { recursive: true });
+    vfs.writeFileSync('/src/router.ts', 'export const routeTree = {};');
+    vfs.mkdirSync('/node_modules/router-entry-resolver', { recursive: true });
+    vfs.writeFileSync(
+      '/node_modules/router-entry-resolver/package.json',
+      JSON.stringify({ name: 'router-entry-resolver', main: 'index.js' })
+    );
+    vfs.writeFileSync(
+      '/node_modules/router-entry-resolver/index.js',
+      `const assert = require('node:assert');
+const { statSync } = require('node:fs');
+
+module.exports = function resolveRouterEntry() {
+  for (const ext of ['.ts', '.js', '.mts', '.mjs', '.tsx', '.jsx']) {
+    const candidate = '/src/router' + ext;
+    const stats = statSync(candidate, { throwIfNoEntry: false });
+    if (stats?.isFile()) {
+      assert(candidate.endsWith('.ts'), 'router should resolve to the TS source file');
+      return candidate;
+    }
+  }
+  return undefined;
+};`
+    );
+
+    const builtins = await createBuiltinModules(() => createFsShim(vfs, () => '/'));
+    const { require } = createVfsRequire(vfs, '/', {
+      builtinModules: builtins,
+      process: { env: {}, cwd: () => '/' },
+    });
+    const resolver = require('router-entry-resolver');
+
+    if (typeof resolver !== 'function') {
+      throw new Error('router-entry-resolver did not export a function');
+    }
+
+    expect(resolver()).toBe('/src/router.ts');
   });
 });
 

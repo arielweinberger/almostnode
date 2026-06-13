@@ -347,10 +347,25 @@ function redirectNpmImportsRegex(
  */
 export function transformEsmToCjsSimple(code: string): string {
   try {
-    return transformEsmToCjsAst(code);
+    return transformDynamicImportsToRequire(transformImportMetaReferences(transformEsmToCjsAst(code)));
   } catch {
-    return transformEsmToCjsRegex(code);
+    return transformDynamicImportsToRequire(transformImportMetaReferences(transformEsmToCjsRegex(code)));
   }
+}
+
+export function transformDynamicImportsToRequire(code: string): string {
+  return code.replace(
+    /(^|[^\w$.])import\s*\(/g,
+    (_match, prefix: string) => `${prefix}__dynamicImport(`
+  );
+}
+
+function transformImportMetaReferences(code: string): string {
+  return code
+    .replace(/\bimport\.meta\.url\b/g, 'import_meta.url')
+    .replace(/\bimport\.meta\.filename\b/g, 'import_meta.filename')
+    .replace(/\bimport\.meta\.dirname\b/g, 'import_meta.dirname')
+    .replace(/\bimport\.meta\b/g, 'import_meta');
 }
 
 /** AST-based ESM→CJS transform using acorn. */
