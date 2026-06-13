@@ -346,6 +346,7 @@ describe('ViteDevServer', () => {
 
   beforeEach(() => {
     Reflect.deleteProperty(globalThis, '__tailwindTransformCount');
+    Reflect.deleteProperty(globalThis, '__fakeReactVitePlugin');
 
     vfs = new VirtualFS();
 
@@ -430,6 +431,67 @@ h1 {
       expect(response.body.toString()).toContain('font-family');
     });
 
+    it('should resolve extensionless Vite module requests', async () => {
+      vfs.writeFileSync(
+        '/src/schema.ts',
+        `export const label: string = 'extensionless';`
+      );
+
+      const tsResponse = await server.handleRequest('GET', '/src/schema', {});
+      const jsxResponse = await server.handleRequest('GET', '/src/App', {});
+      const cssResponse = await server.handleRequest('GET', '/src/style', {
+        accept: 'text/css,*/*;q=0.1',
+      });
+
+      expect(tsResponse.statusCode).toBe(200);
+      expect(tsResponse.headers['Content-Type']).toBe(
+        'application/javascript; charset=utf-8'
+      );
+      expect(tsResponse.body.toString()).toContain('extensionless');
+
+      expect(jsxResponse.statusCode).toBe(200);
+      expect(jsxResponse.headers['Content-Type']).toBe(
+        'application/javascript; charset=utf-8'
+      );
+      expect(jsxResponse.body.toString()).toContain('Hello World');
+
+      expect(cssResponse.statusCode).toBe(200);
+      expect(cssResponse.headers['Content-Type']).toBe('text/css; charset=utf-8');
+      expect(cssResponse.body.toString()).toContain('font-family');
+    });
+
+    it('should rewrite installed package imports to VFS npm bundles', async () => {
+      vfs.mkdirSync('/node_modules/ai', { recursive: true });
+      vfs.writeFileSync(
+        '/node_modules/ai/package.json',
+        JSON.stringify({ name: 'ai', version: '6.0.0', main: './index.js' })
+      );
+      vfs.writeFileSync(
+        '/src/deps.js',
+        `import { streamText } from 'ai';
+import React from 'react';
+
+export { streamText, React };`
+      );
+
+      const response = await server.handleRequest('GET', '/src/deps.js', {});
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(body).toContain('"/_npm/ai"');
+      expect(body).toContain('https://esm.sh/react@');
+      expect(body).not.toContain('"/_npm/react"');
+    });
+
+    it('should expose a Vite npm bundle route', async () => {
+      const emptyResponse = await server.handleRequest('GET', '/_npm/', {});
+      expect(emptyResponse.statusCode).toBe(404);
+
+      const missingResponse = await server.handleRequest('GET', '/_npm/not-installed', {});
+      expect(missingResponse.statusCode).toBe(500);
+      expect(missingResponse.body.toString()).toContain('not-installed');
+    });
+
     it('should serve CSS stylesheet requests as CSS when accept header asks for CSS', async () => {
       const response = await server.handleRequest('GET', '/src/style.css', {
         accept: 'text/css,*/*;q=0.1',
@@ -510,6 +572,231 @@ export default defineConfig({
 
       const afterSourceChange = await server.handleRequest('GET', '/src/tailwind.css', {});
       expect(afterSourceChange.body.toString()).toContain('.transform-count-2');
+    });
+
+    it('should not run build-only Vite plugin transforms while serving dev CSS', async () => {
+      vfs.writeFileSync(
+        '/vite.config.ts',
+        `import { defineConfig } from 'vite';
+
+export default defineConfig({
+  plugins: [
+    {
+      name: 'serve-only-css-plugin',
+      apply: 'serve',
+      transform(code, id) {
+        if (!id.endsWith('.css')) return null;
+        return { code: code + '\\n.serve-only { color: rgb(20 184 166); }' };
+      },
+    },
+    {
+      name: 'build-only-css-plugin',
+      apply: 'build',
+      transform() {
+        throw new Error('build-only transform ran during dev serve');
+      },
+    },
+  ],
+});`
+      );
+      vfs.writeFileSync('/src/app.css', '.card { display: grid; }');
+
+      const response = await server.handleRequest('GET', '/src/app.css', {});
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(body).toContain('.serve-only');
+      expect(body).not.toContain('build-only transform ran during dev serve');
+    });
+
+    it('should resolve package directory CSS imports to index.css for Vite plugins', async () => {
+      vfs.mkdirSync('/node_modules/directory-css', { recursive: true });
+      vfs.writeFileSync('/node_modules/directory-css/index.css', '.from-directory { color: green; }');
+      vfs.writeFileSync(
+        '/vite.config.ts',
+        `import { defineConfig } from 'vite';
+
+let cssResolver;
+
+export default defineConfig({
+  plugins: [
+    {
+      name: 'css-directory-resolver',
+      configResolved(config) {
+        cssResolver = config.createResolver();
+      },
+      async transform(code, id) {
+        if (!id.endsWith('.css')) return null;
+        const resolved = await cssResolver('directory-css', id);
+        return { code: code + '\\n/* resolved:' + resolved + ' */' };
+      },
+    },
+  ],
+});`
+      );
+      vfs.writeFileSync('/src/app.css', '@import "directory-css";');
+
+      const response = await server.handleRequest('GET', '/src/app.css', {});
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(body).toContain('/* resolved:/node_modules/directory-css/index.css */');
+    });
+
+    it('should load React Vite plugins that import vite/internal', async () => {
+      vfs.mkdirSync('/node_modules/fake-react-vite-plugin', { recursive: true });
+      vfs.writeFileSync(
+        '/node_modules/fake-react-vite-plugin/package.json',
+        JSON.stringify({
+          name: 'fake-react-vite-plugin',
+          version: '1.0.0-test',
+          main: './index.js',
+        })
+      );
+      vfs.writeFileSync(
+        '/node_modules/fake-react-vite-plugin/index.js',
+        `const { reactRefreshWrapperPlugin } = require('vite/internal');
+
+module.exports = function fakeReact() {
+  return {
+    name: 'fake-react-vite-plugin',
+    configResolved(config) {
+      const wrapper = reactRefreshWrapperPlugin({});
+      globalThis.__fakeReactVitePlugin = {
+        base: config.base,
+        hmr: config.server.hmr,
+        bundledDev: config.experimental.bundledDev,
+        isProduction: config.isProduction,
+        wrapperName: wrapper.name,
+      };
+    },
+  };
+};`
+      );
+      vfs.writeFileSync(
+        '/vite.config.ts',
+        `import { defineConfig } from 'vite';
+import fakeReact from 'fake-react-vite-plugin';
+
+export default defineConfig({
+  plugins: [fakeReact()],
+});`
+      );
+      vfs.writeFileSync('/src/app.css', '.card { display: grid; }');
+
+      const response = await server.handleRequest('GET', '/src/app.css', {});
+
+      expect(response.statusCode).toBe(200);
+      expect(Reflect.get(globalThis, '__fakeReactVitePlugin')).toEqual({
+        base: '/',
+        hmr: true,
+        bundledDev: false,
+        isProduction: false,
+        wrapperName: 'vite:react-refresh-wrapper:almostnode-noop',
+      });
+    });
+
+    it('should expose Vite loadEnv to config plugins', async () => {
+      vfs.mkdirSync('/node_modules/fake-env-vite-plugin', { recursive: true });
+      vfs.writeFileSync(
+        '/node_modules/fake-env-vite-plugin/package.json',
+        JSON.stringify({
+          name: 'fake-env-vite-plugin',
+          version: '1.0.0-test',
+          main: './index.js',
+        })
+      );
+      vfs.writeFileSync(
+        '/node_modules/fake-env-vite-plugin/index.js',
+        `const { loadEnv } = require('vite');
+
+module.exports = function fakeEnv() {
+  return {
+    name: 'fake-env-vite-plugin',
+    configResolved(config) {
+      globalThis.__fakeEnvVitePlugin = loadEnv(config.mode, config.root, 'VITE_');
+    },
+  };
+};`
+      );
+      vfs.writeFileSync('/.env', 'VITE_VISIBLE=from-env\nPRIVATE_VALUE=hidden\n');
+      vfs.writeFileSync(
+        '/vite.config.ts',
+        `import { defineConfig } from 'vite';
+import fakeEnv from 'fake-env-vite-plugin';
+
+export default defineConfig({
+  plugins: [fakeEnv()],
+});`
+      );
+      vfs.writeFileSync('/src/app.css', '.card { color: rebeccapurple; }');
+
+      const response = await server.handleRequest('GET', '/src/app.css', {});
+
+      expect(response.statusCode).toBe(200);
+      expect(Reflect.get(globalThis, '__fakeEnvVitePlugin')).toEqual({
+        VITE_VISIBLE: 'from-env',
+      });
+    });
+
+    it('should respect Vite transform hook filters for CSS requests', async () => {
+      vfs.writeFileSync(
+        '/vite.config.ts',
+        `import { defineConfig } from 'vite';
+
+export default defineConfig({
+  plugins: [
+    {
+      name: 'filtered-js-transform',
+      transform: {
+        filter: {
+          id: /\\.(m|c)?(j|t)sx?$/,
+        },
+        handler() {
+          throw new Error('JS transform should not run for CSS');
+        },
+      },
+    },
+  ],
+});`
+      );
+      vfs.writeFileSync('/src/app.css', '.card { color: rebeccapurple; }');
+
+      const response = await server.handleRequest('GET', '/src/app.css', {});
+
+      expect(response.statusCode).toBe(200);
+    });
+
+    it('should provide a Vite environment on transform hook context', async () => {
+      vfs.writeFileSync(
+        '/vite.config.ts',
+        `import { defineConfig } from 'vite';
+
+export default defineConfig({
+  plugins: [
+    {
+      name: 'environment-probe',
+      vite: {
+        applyToEnvironment(environment) {
+          globalThis.__environmentProbeApply = environment.name;
+          return true;
+        },
+      },
+      transform(code) {
+        globalThis.__environmentProbeContext = this.environment.name;
+        return code;
+      },
+    },
+  ],
+});`
+      );
+      vfs.writeFileSync('/src/app.css', '.card { color: rebeccapurple; }');
+
+      const response = await server.handleRequest('GET', '/src/app.css', {});
+
+      expect(response.statusCode).toBe(200);
+      expect(Reflect.get(globalThis, '__environmentProbeApply')).toBe('client');
+      expect(Reflect.get(globalThis, '__environmentProbeContext')).toBe('client');
     });
 
     it('should return 404 for missing files', async () => {
@@ -711,6 +998,21 @@ export default defineConfig({
       expect(importmapPos).toBeLessThan(headClosePos);
     });
 
+    it('should expose Vite import.meta.env defaults before module scripts', async () => {
+      const response = await server.handleRequest('GET', '/', {});
+      const body = response.body.toString();
+
+      const envPos = body.indexOf('__ALMOSTNODE_IMPORT_META_ENV__');
+      const firstModulePos = body.indexOf('<script type="module">');
+
+      expect(envPos).not.toBe(-1);
+      expect(firstModulePos).not.toBe(-1);
+      expect(envPos).toBeLessThan(firstModulePos);
+      expect(body).toContain("BASE_URL: baseUrl ? baseUrl + '/' : '/'");
+      expect(body).toContain("MODE: 'development'");
+      expect(body).toContain('DEV: true');
+    });
+
     it('should NOT inject import map when HTML already has one', async () => {
       vfs.writeFileSync(
         '/index.html',
@@ -795,6 +1097,23 @@ export default helper;`
       expect(body).toContain('import("../lib/lazy.js")');
       expect(body).toContain('fetch("../api/data.json")');
       expect(body).toContain('fetch("https://example.com/api")');
+    });
+
+    it('should rewrite import.meta.env to the injected Vite env object', async () => {
+      vfs.writeFileSync(
+        '/src/env.js',
+        `export const baseUrl = import.meta.env.BASE_URL;
+export const isDev = import.meta.env.DEV;`
+      );
+
+      const response = await server.handleRequest('GET', '/src/env.js', {});
+      const body = response.body.toString();
+
+      expect(response.statusCode).toBe(200);
+      expect(body).toContain(
+        'window.__ALMOSTNODE_IMPORT_META_ENV__.BASE_URL'
+      );
+      expect(body).toContain('window.__ALMOSTNODE_IMPORT_META_ENV__.DEV');
     });
 
     it('should handle TSX files', async () => {

@@ -7,16 +7,29 @@ import { DevServer, DevServerOptions, ResponseData, HMRUpdate } from '../dev-ser
 import { VirtualFS } from '../virtual-fs';
 import { Buffer } from '../shims/stream';
 import { simpleHash } from '../utils/hash';
-import { addReactRefresh as _addReactRefresh } from './code-transforms';
+import { addReactRefresh as _addReactRefresh, redirectNpmImports as _redirectNpmImports } from './code-transforms';
+import { bundleNpmModuleForBrowser, clearNpmBundleCache, initNpmServe } from './npm-serve';
 import { ESBUILD_WASM_ESM_CDN, ESBUILD_WASM_BINARY_CDN, REACT_REFRESH_CDN, REACT_CDN, REACT_DOM_CDN } from '../config/cdn';
 import { VitePluginContainer } from './vite-plugin-container';
 import { importExternalModule } from '../utils/external-import';
 
-// Check if we're in a real browser environment (not jsdom or Node.js)
-// jsdom has window but doesn't have ServiceWorker or SharedArrayBuffer
-const isBrowser = typeof window !== 'undefined' &&
+type EsbuildRuntimeGlobal = typeof globalThis & {
+  __esbuild?: typeof import('esbuild-wasm');
+  __esbuildInitPromise?: Promise<void>;
+  importScripts?: (...urls: string[]) => void;
+};
+
+const esbuildRuntimeGlobal = globalThis as EsbuildRuntimeGlobal;
+
+// Check if we're in a real browser runtime (window, service worker, or worker),
+// not jsdom or Node.js. AlmostNode can serve Vite requests from a worker-like
+// context, so tying transforms to `window` skips npm import rewriting there.
+const isBrowserWindow = typeof window !== 'undefined' &&
   typeof window.navigator !== 'undefined' &&
   'serviceWorker' in window.navigator;
+const isBrowserWorker = typeof self !== 'undefined' &&
+  typeof esbuildRuntimeGlobal.importScripts === 'function';
+const isBrowser = isBrowserWindow || isBrowserWorker;
 
 // Window.__esbuild type is declared in src/types/external.d.ts
 
@@ -28,16 +41,16 @@ async function initEsbuild(): Promise<void> {
   if (!isBrowser) return;
 
   // Check if already initialized (survives HMR)
-  if (window.__esbuild) {
+  if (esbuildRuntimeGlobal.__esbuild) {
     return;
   }
 
   // Check if initialization is in progress
-  if (window.__esbuildInitPromise) {
-    return window.__esbuildInitPromise;
+  if (esbuildRuntimeGlobal.__esbuildInitPromise) {
+    return esbuildRuntimeGlobal.__esbuildInitPromise;
   }
 
-  window.__esbuildInitPromise = (async () => {
+  esbuildRuntimeGlobal.__esbuildInitPromise = (async () => {
     try {
       const mod = await importExternalModule<
         typeof import('esbuild-wasm') & {
@@ -62,22 +75,22 @@ async function initEsbuild(): Promise<void> {
         }
       }
 
-      window.__esbuild = esbuildMod;
+      esbuildRuntimeGlobal.__esbuild = esbuildMod;
     } catch (error) {
       console.error('[ViteDevServer] Failed to initialize esbuild:', error);
-      window.__esbuildInitPromise = undefined;
+      esbuildRuntimeGlobal.__esbuildInitPromise = undefined;
       throw error;
     }
   })();
 
-  return window.__esbuildInitPromise;
+  return esbuildRuntimeGlobal.__esbuildInitPromise;
 }
 
 /**
  * Get the esbuild instance (after initialization)
  */
 function getEsbuild(): typeof import('esbuild-wasm') | undefined {
-  return isBrowser ? window.__esbuild : undefined;
+  return isBrowser ? esbuildRuntimeGlobal.__esbuild : undefined;
 }
 
 export interface ViteDevServerOptions extends DevServerOptions {
@@ -286,10 +299,27 @@ const HMR_CLIENT_SCRIPT = `
 </script>
 `;
 
+const VITE_IMPORT_META_ENV_SCRIPT = `
+<script>
+(() => {
+  const match = window.location.pathname.match(/^\\/__virtual__\\/\\d+(?:\\/|$)/);
+  const baseUrl = match ? match[0].replace(/\\/$/, '') : '';
+  window.__ALMOSTNODE_IMPORT_META_ENV__ = Object.freeze({
+    BASE_URL: baseUrl ? baseUrl + '/' : '/',
+    MODE: 'development',
+    DEV: true,
+    PROD: false,
+    SSR: false,
+  });
+})();
+</script>
+`;
+
 function isLocalRootAbsoluteUrl(url: string): boolean {
   return url.startsWith('/') &&
     !url.startsWith('//') &&
-    !url.startsWith('/__virtual__');
+    !url.startsWith('/__virtual__') &&
+    !url.startsWith('/_npm/');
 }
 
 function splitUrlSuffix(url: string): { pathname: string; suffix: string } {
@@ -360,7 +390,7 @@ function rewriteHtmlRootUrls(html: string, filePath: string): string {
 }
 
 function rewriteJsRootUrls(code: string, filePath: string): string {
-  return code
+  return rewriteImportMetaEnv(code)
     .replace(
       /(\b(?:import|export)\s+(?:[^'"]*?\s+from\s*)?|\bimport\s*\(\s*)(["'])(\/(?!\/|__virtual__)[^"']+)\2/g,
       (_match, prefix: string, quote: string, url: string) =>
@@ -371,6 +401,13 @@ function rewriteJsRootUrls(code: string, filePath: string): string {
       (_match, prefix: string, quote: string, url: string) =>
         `${prefix}${quote}${rewriteRootAbsoluteUrl(filePath, url)}${quote}`
     );
+}
+
+function rewriteImportMetaEnv(code: string): string {
+  return code.replace(
+    /\bimport\.meta\.env\b/g,
+    'window.__ALMOSTNODE_IMPORT_META_ENV__'
+  );
 }
 
 function rewriteCssRootUrls(css: string, filePath: string): string {
@@ -387,6 +424,16 @@ function rewriteCssRootUrls(css: string, filePath: string): string {
     );
 }
 
+const EXTENSIONLESS_FILE_EXTENSIONS = [
+  '.js',
+  '.jsx',
+  '.ts',
+  '.tsx',
+  '.json',
+  '.css',
+  '.html',
+];
+
 export class ViteDevServer extends DevServer {
   private watcherCleanup: (() => void) | null = null;
   private options: ViteDevServerOptions;
@@ -394,9 +441,12 @@ export class ViteDevServer extends DevServer {
   private transformCache: Map<string, { code: string; hash: string }> = new Map();
   private cssTransformCache: Map<string, { code: string; hash: string }> = new Map();
   private pluginContainer: VitePluginContainer;
+  private _dependencies: Record<string, string> | undefined;
+  private _installedPackages: Set<string> | undefined;
 
   constructor(vfs: VirtualFS, options: ViteDevServerOptions) {
     super(vfs, options);
+    initNpmServe(vfs);
     this.options = {
       jsx: true,
       jsxFactory: 'React.createElement',
@@ -433,19 +483,14 @@ export class ViteDevServer extends DevServer {
       pathname = '/index.html';
     }
 
-    // Resolve the full path
-    const filePath = this.resolvePath(pathname);
+    if (pathname.startsWith('/_npm/')) {
+      return this.serveNpmModule(pathname);
+    }
 
-    // Check if file exists
-    if (!this.exists(filePath)) {
-      // Try with .html extension
-      if (this.exists(filePath + '.html')) {
-        return this.serveFile(filePath + '.html');
-      }
-      // Try index.html in directory
-      if (this.isDirectory(filePath) && this.exists(filePath + '/index.html')) {
-        return this.serveFile(filePath + '/index.html');
-      }
+    const requestedFilePath = this.resolvePath(pathname);
+    const filePath = this.resolveExistingRequestPath(requestedFilePath);
+
+    if (!filePath) {
       return this.notFound(pathname);
     }
 
@@ -458,17 +503,17 @@ export class ViteDevServer extends DevServer {
     }
 
     // Check if file needs transformation (JSX/TS)
-    if (this.needsTransform(pathname)) {
-      return this.transformAndServe(filePath, pathname);
+    if (this.needsTransform(filePath)) {
+      return this.transformAndServe(filePath);
     }
 
-    if (/\.(js|mjs)$/.test(pathname)) {
+    if (/\.(js|mjs)$/.test(filePath)) {
       return this.serveJsFile(filePath);
     }
 
     // Check if CSS is being imported as a module (needs to be converted to JS)
     // In browser context with ES modules, CSS imports need to be served as JS
-    if (pathname.endsWith('.css')) {
+    if (filePath.endsWith('.css')) {
       // Check various header formats for sec-fetch-dest
       const secFetchDest =
         headers['sec-fetch-dest'] ||
@@ -500,7 +545,7 @@ export class ViteDevServer extends DevServer {
     }
 
     // Check if it's HTML that needs HMR client injection
-    if (pathname.endsWith('.html')) {
+    if (filePath.endsWith('.html')) {
       return this.serveHtmlWithHMR(filePath);
     }
 
@@ -578,6 +623,10 @@ export class ViteDevServer extends DevServer {
       this.pluginContainer.invalidate();
     }
 
+    if (path.endsWith('/package.json')) {
+      this.clearInstalledPackagesCache();
+    }
+
     if (!isCSS && isContentFile) {
       for (const cssPath of this.getCompiledTailwindCssPaths()) {
         this.sendHMRUpdate({
@@ -623,10 +672,26 @@ export class ViteDevServer extends DevServer {
     return /\.(jsx|tsx|ts)$/.test(path);
   }
 
+  private resolveExistingRequestPath(filePath: string): string | null {
+    if (this.exists(filePath)) return filePath;
+
+    for (const extension of EXTENSIONLESS_FILE_EXTENSIONS) {
+      const candidate = `${filePath}${extension}`;
+      if (this.exists(candidate)) return candidate;
+    }
+
+    for (const extension of EXTENSIONLESS_FILE_EXTENSIONS) {
+      const candidate = `${filePath}/index${extension}`;
+      if (this.exists(candidate)) return candidate;
+    }
+
+    return null;
+  }
+
   /**
    * Transform and serve a JSX/TS file
    */
-  private async transformAndServe(filePath: string, urlPath: string): Promise<ResponseData> {
+  private async transformAndServe(filePath: string): Promise<ResponseData> {
     try {
       const content = this.vfs.readFileSync(filePath, 'utf8');
       const hash = simpleHash(content);
@@ -649,7 +714,7 @@ export class ViteDevServer extends DevServer {
         };
       }
 
-      const transformed = await this.transformCode(content, urlPath);
+      const transformed = await this.transformCode(content, filePath);
 
       // Cache the transform result
       this.transformCache.set(filePath, { code: transformed, hash });
@@ -688,7 +753,7 @@ export class ViteDevServer extends DevServer {
   private async transformCode(code: string, filename: string): Promise<string> {
     if (!isBrowser) {
       // In test environment, just return code as-is
-      return rewriteJsRootUrls(code, filename);
+      return rewriteJsRootUrls(this.redirectNpmImports(code), filename);
     }
 
     // Initialize esbuild if needed
@@ -721,7 +786,7 @@ export class ViteDevServer extends DevServer {
       transformed = this.addReactRefresh(transformed, filename);
     }
 
-    return rewriteJsRootUrls(transformed, filename);
+    return rewriteJsRootUrls(this.redirectNpmImports(transformed), filename);
   }
 
   private addReactRefresh(code: string, filename: string): string {
@@ -730,7 +795,8 @@ export class ViteDevServer extends DevServer {
 
   private serveJsFile(filePath: string): ResponseData {
     try {
-      const code = rewriteJsRootUrls(this.vfs.readFileSync(filePath, 'utf8'), filePath);
+      const source = this.vfs.readFileSync(filePath, 'utf8');
+      const code = rewriteJsRootUrls(this.redirectNpmImports(source), filePath);
       const buffer = Buffer.from(code);
 
       return {
@@ -744,6 +810,7 @@ export class ViteDevServer extends DevServer {
         body: buffer,
       };
     } catch (error) {
+      console.error('[ViteDevServer] CSS module error:', error);
       return this.serverError(error);
     }
   }
@@ -784,6 +851,7 @@ export default css;
         body: buffer,
       };
     } catch (error) {
+      console.error('[ViteDevServer] CSS file error:', error);
       return this.serverError(error);
     }
   }
@@ -824,6 +892,112 @@ export default css;
     const code = rewriteCssRootUrls(transformed, filePath);
     this.cssTransformCache.set(filePath, { code, hash });
     return code;
+  }
+
+  private getDependencies(): Record<string, string> {
+    if (this._dependencies) return this._dependencies;
+
+    let deps: Record<string, string> = {};
+    const pkgPath = this.root === '/' ? '/package.json' : `${this.root}/package.json`;
+
+    try {
+      if (this.vfs.existsSync(pkgPath)) {
+        const pkg = JSON.parse(this.vfs.readFileSync(pkgPath, 'utf-8')) as {
+          dependencies?: Record<string, string>;
+          devDependencies?: Record<string, string>;
+        };
+        deps = { ...pkg.dependencies, ...pkg.devDependencies };
+      }
+    } catch {
+      // Ignore malformed package manifests; unresolved imports will fail normally.
+    }
+
+    this._dependencies = deps;
+    return deps;
+  }
+
+  private getInstalledPackages(): Set<string> {
+    if (this._installedPackages) return this._installedPackages;
+
+    const packages = new Set<string>();
+    const nodeModulesDir = '/node_modules';
+
+    try {
+      if (!this.vfs.existsSync(nodeModulesDir)) {
+        this._installedPackages = packages;
+        return packages;
+      }
+
+      const entries = this.vfs.readdirSync(nodeModulesDir) as string[];
+      for (const entry of entries) {
+        if (entry.startsWith('.')) continue;
+
+        if (entry.startsWith('@')) {
+          const scopeDir = `${nodeModulesDir}/${entry}`;
+          try {
+            const scopeEntries = this.vfs.readdirSync(scopeDir) as string[];
+            for (const scopedPackage of scopeEntries) {
+              packages.add(`${entry}/${scopedPackage}`);
+            }
+          } catch {
+            // Ignore incomplete scoped package directories.
+          }
+          continue;
+        }
+
+        packages.add(entry);
+      }
+    } catch {
+      // Ignore filesystem errors; unresolved imports will fail normally.
+    }
+
+    this._installedPackages = packages;
+    return packages;
+  }
+
+  clearInstalledPackagesCache(): void {
+    this._dependencies = undefined;
+    this._installedPackages = undefined;
+    clearNpmBundleCache();
+  }
+
+  private async serveNpmModule(pathname: string): Promise<ResponseData> {
+    const specifier = pathname.slice('/_npm/'.length);
+    if (!specifier) {
+      return this.notFound(pathname);
+    }
+
+    try {
+      const code = await bundleNpmModuleForBrowser(specifier);
+      return {
+        statusCode: 200,
+        statusMessage: 'OK',
+        headers: {
+          'Content-Type': 'application/javascript; charset=utf-8',
+          'Cache-Control': 'public, max-age=31536000, immutable',
+        },
+        body: Buffer.from(code),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[ViteDevServer] Failed to bundle npm module '${specifier}':`, message);
+      return {
+        statusCode: 500,
+        statusMessage: 'Internal Server Error',
+        headers: { 'Content-Type': 'text/plain' },
+        body: Buffer.from(`Failed to bundle '${specifier}': ${message}`),
+      };
+    }
+  }
+
+  private redirectNpmImports(code: string): string {
+    return _redirectNpmImports(
+      code,
+      undefined,
+      this.getDependencies(),
+      undefined,
+      this.getInstalledPackages(),
+    );
   }
 
   private getCompiledTailwindCssPaths(): string[] {
@@ -906,6 +1080,17 @@ export default css;
       let match;
       while ((match = importMapRegex.exec(content)) !== null) {
         lastImportMapEnd = match.index + match[0].length;
+      }
+
+      if (lastImportMapEnd !== -1) {
+        content = content.slice(0, lastImportMapEnd) + VITE_IMPORT_META_ENV_SCRIPT + content.slice(lastImportMapEnd);
+        lastImportMapEnd += VITE_IMPORT_META_ENV_SCRIPT.length;
+      } else if (content.includes('<head>')) {
+        content = content.replace('<head>', `<head>${VITE_IMPORT_META_ENV_SCRIPT}`);
+      } else if (content.includes('<html')) {
+        content = content.replace(/<html[^>]*>/, `$&${VITE_IMPORT_META_ENV_SCRIPT}`);
+      } else {
+        content = VITE_IMPORT_META_ENV_SCRIPT + content;
       }
 
       if (lastImportMapEnd !== -1) {

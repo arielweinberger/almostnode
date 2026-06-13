@@ -338,14 +338,56 @@ describe('createBuiltinModules', () => {
 
     expect(modules.https).toBeDefined();
     expect(modules.http).toBeDefined();
+    expect(modules.http2).toBeDefined();
     expect(modules.path).toBeDefined();
     expect(modules.url).toBeDefined();
     expect(modules.querystring).toBeDefined();
     expect(modules.util).toBeDefined();
     expect(modules.events).toBeDefined();
     expect(modules.stream).toBeDefined();
+    expect(modules['stream/promises']).toBeDefined();
+    expect(modules['stream/web']).toBeDefined();
     expect(modules.buffer).toBeDefined();
     expect(modules.crypto).toBeDefined();
+    expect(modules.net).toBeDefined();
+    expect(modules.tls).toBeDefined();
+    expect(modules.dns).toBeDefined();
+    expect(modules.readline).toBeDefined();
+    expect(modules.cluster).toBeDefined();
+    expect(modules.dgram).toBeDefined();
+    expect(modules.domain).toBeDefined();
+    expect(modules.inspector).toBeDefined();
+    expect(modules['inspector/promises']).toBe(modules.inspector);
+    expect(modules.diagnostics_channel).toBeDefined();
+  });
+
+  it('maps stream/promises to the stream promises shim', async () => {
+    const modules = await createBuiltinModules();
+    const streamModule = modules.stream;
+    if (typeof streamModule !== 'object' || streamModule === null || !('promises' in streamModule)) {
+      throw new Error('stream shim did not expose promises');
+    }
+
+    expect(modules['stream/promises']).toBe(streamModule.promises);
+  });
+
+  it('maps stream/web to native Web Streams constructors', async () => {
+    const modules = await createBuiltinModules();
+    const streamWebModule = modules['stream/web'];
+    if (typeof streamWebModule !== 'object' || streamWebModule === null) {
+      throw new Error('stream/web shim did not resolve to an object');
+    }
+    if (
+      !('ReadableStream' in streamWebModule) ||
+      !('WritableStream' in streamWebModule) ||
+      !('TransformStream' in streamWebModule)
+    ) {
+      throw new Error('stream/web shim did not expose Web Streams constructors');
+    }
+
+    expect(streamWebModule.ReadableStream).toBe(globalThis.ReadableStream);
+    expect(streamWebModule.WritableStream).toBe(globalThis.WritableStream);
+    expect(streamWebModule.TransformStream).toBe(globalThis.TransformStream);
   });
 
   it('does not include fs by default', async () => {

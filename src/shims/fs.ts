@@ -25,8 +25,10 @@ export interface FsShim {
   readdirSync(path: PathLike): string[];
   readdirSync(path: PathLike, options: { withFileTypes: true }): Dirent[];
   readdirSync(path: PathLike, options?: { withFileTypes?: boolean; encoding?: string } | string): string[] | Dirent[];
-  statSync(path: PathLike, options?: { bigint?: boolean }): Stats;
-  lstatSync(path: PathLike, options?: { bigint?: boolean }): Stats;
+  statSync(path: PathLike, options: { throwIfNoEntry: false; bigint?: boolean }): Stats | undefined;
+  statSync(path: PathLike, options?: { throwIfNoEntry?: true; bigint?: boolean }): Stats;
+  lstatSync(path: PathLike, options: { throwIfNoEntry: false; bigint?: boolean }): Stats | undefined;
+  lstatSync(path: PathLike, options?: { throwIfNoEntry?: true; bigint?: boolean }): Stats;
   fstatSync(fd: number, options?: { bigint?: boolean }): Stats;
   unlinkSync(path: PathLike): void;
   rmdirSync(path: PathLike): void;
@@ -61,6 +63,7 @@ export interface FsShim {
 }
 
 export interface FsPromises {
+  open(path: PathLike, flags?: string | number, mode?: number): Promise<FileHandle>;
   readFile(path: PathLike): Promise<Buffer>;
   readFile(path: PathLike, encoding: 'utf8' | 'utf-8'): Promise<string>;
   readFile(path: PathLike, options: { encoding: 'utf8' | 'utf-8' }): Promise<string>;
@@ -75,6 +78,19 @@ export interface FsPromises {
   access(path: PathLike, mode?: number): Promise<void>;
   realpath(path: PathLike): Promise<string>;
   copyFile(src: PathLike, dest: PathLike): Promise<void>;
+}
+
+export interface FileHandle {
+  fd: number;
+  readFile(encoding?: 'utf8' | 'utf-8' | { encoding?: 'utf8' | 'utf-8' | null }): Promise<Buffer | string>;
+  writeFile(data: string | Uint8Array): Promise<void>;
+  read(buffer: Buffer | Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{ bytesRead: number; buffer: Buffer | Uint8Array }>;
+  write(buffer: Buffer | Uint8Array | string, offset?: number, length?: number, position?: number | null): Promise<{ bytesWritten: number; buffer: Buffer | Uint8Array | string }>;
+  stat(): Promise<Stats>;
+  truncate(len?: number): Promise<void>;
+  sync(): Promise<void>;
+  datasync(): Promise<void>;
+  close(): Promise<void>;
 }
 
 export interface FsConstants {
@@ -245,6 +261,179 @@ function trackCall(method: 'statSync' | 'readdirSync', path: string): void {
 export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
   // Helper to resolve paths with cwd
   const resolvePath = (pathLike: unknown) => toPath(pathLike, getCwd);
+  const createBadFileDescriptorError = (operation: string): Error => {
+    const err = new Error(`EBADF: bad file descriptor, ${operation}`);
+    Object.assign(err, { code: 'EBADF', errno: -9 });
+    return err;
+  };
+  const getDescriptor = (fd: number, operation: string): FileDescriptor => {
+    const entry = fdMap.get(fd);
+    if (!entry) {
+      throw createBadFileDescriptorError(operation);
+    }
+    return entry;
+  };
+  const openDescriptor = (pathLike: unknown, flags: string | number = 'r', _mode?: number): number => {
+    const path = resolvePath(pathLike);
+    const flagStr = typeof flags === 'number' ? 'r' : flags;
+    const exists = vfs.existsSync(path);
+    const isWriteMode = flagStr.includes('w') || flagStr.includes('a');
+    const isReadMode = flagStr.includes('r') && !flagStr.includes('+');
+
+    if (!exists && isReadMode) {
+      throw createNodeError('ENOENT', 'open', path);
+    }
+
+    let content: Uint8Array;
+    let isDirectory = false;
+    if (exists && !flagStr.includes('w')) {
+      const stats = vfs.statSync(path);
+      isDirectory = stats.isDirectory();
+      content = isDirectory ? new Uint8Array(0) : vfs.readFileSync(path);
+    } else {
+      content = new Uint8Array(0);
+      if (isWriteMode) {
+        const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
+        if (!vfs.existsSync(parentPath)) {
+          vfs.mkdirSync(parentPath, { recursive: true });
+        }
+      }
+    }
+
+    const fd = nextFd++;
+    fdMap.set(fd, {
+      path,
+      position: flagStr.includes('a') ? content.length : 0,
+      flags: flagStr,
+      content: new Uint8Array(content),
+      isDirectory,
+    });
+    return fd;
+  };
+  const closeDescriptor = (fd: number): void => {
+    const entry = fdMap.get(fd);
+    if (!entry) return;
+    if (!entry.isDirectory && (entry.flags.includes('w') || entry.flags.includes('a') || entry.flags.includes('+'))) {
+      vfs.writeFileSync(entry.path, entry.content);
+    }
+    fdMap.delete(fd);
+  };
+  const fstatDescriptor = (fd: number, options?: { bigint?: boolean }): Stats => {
+    const entry = getDescriptor(fd, 'fstat');
+    const result = vfs.statSync(entry.path);
+    return options?.bigint ? toBigIntStats(result) : result;
+  };
+  const readDescriptor = (
+    fd: number,
+    buffer: Buffer | Uint8Array,
+    offset: number,
+    length: number,
+    position: number | null
+  ): number => {
+    const entry = getDescriptor(fd, 'read');
+    const readPos = position !== null ? position : entry.position;
+    const bytesToRead = Math.min(length, entry.content.length - readPos);
+
+    if (bytesToRead <= 0) {
+      return 0;
+    }
+
+    for (let i = 0; i < bytesToRead; i++) {
+      buffer[offset + i] = entry.content[readPos + i];
+    }
+
+    if (position === null) {
+      entry.position += bytesToRead;
+    }
+
+    return bytesToRead;
+  };
+  const writeDescriptor = (
+    fd: number,
+    buffer: Buffer | Uint8Array | string,
+    offset?: number,
+    length?: number,
+    position?: number | null
+  ): number => {
+    const entry = getDescriptor(fd, 'write');
+    let data: Uint8Array;
+    if (typeof buffer === 'string') {
+      data = _encoder.encode(buffer);
+      offset = 0;
+      length = data.length;
+    } else {
+      data = buffer;
+      offset = offset ?? 0;
+      length = length ?? (data.length - offset);
+    }
+
+    const writePos = position !== null && position !== undefined ? position : entry.position;
+    const endPos = writePos + length;
+
+    if (endPos > entry.content.length) {
+      const newContent = new Uint8Array(endPos);
+      newContent.set(entry.content);
+      entry.content = newContent;
+    }
+
+    for (let i = 0; i < length; i++) {
+      entry.content[writePos + i] = data[offset + i];
+    }
+
+    if (position === null || position === undefined) {
+      entry.position = endPos;
+    }
+
+    return length;
+  };
+  const truncateDescriptor = (fd: number, len: number = 0): void => {
+    const entry = getDescriptor(fd, 'ftruncate');
+    if (len < entry.content.length) {
+      entry.content = entry.content.slice(0, len);
+    } else if (len > entry.content.length) {
+      const newContent = new Uint8Array(len);
+      newContent.set(entry.content);
+      entry.content = newContent;
+    }
+  };
+  const createFileHandle = (fd: number): FileHandle => ({
+    fd,
+    async readFile(encodingOrOptions?: 'utf8' | 'utf-8' | { encoding?: 'utf8' | 'utf-8' | null }): Promise<Buffer | string> {
+      const entry = getDescriptor(fd, 'readFile');
+      const encoding = typeof encodingOrOptions === 'string' ? encodingOrOptions : encodingOrOptions?.encoding;
+      if (encoding === 'utf8' || encoding === 'utf-8') {
+        return _decoder.decode(entry.content);
+      }
+      return createBuffer(entry.content);
+    },
+    async writeFile(data: string | Uint8Array): Promise<void> {
+      const entry = getDescriptor(fd, 'writeFile');
+      const bytes = typeof data === 'string' ? _encoder.encode(data) : data;
+      entry.content = new Uint8Array(bytes);
+      entry.position = bytes.length;
+    },
+    async read(buffer: Buffer | Uint8Array, offset = 0, length = buffer.length - offset, position: number | null = null) {
+      return { bytesRead: readDescriptor(fd, buffer, offset, length, position), buffer };
+    },
+    async write(buffer: Buffer | Uint8Array | string, offset?: number, length?: number, position?: number | null) {
+      return { bytesWritten: writeDescriptor(fd, buffer, offset, length, position), buffer };
+    },
+    async stat(): Promise<Stats> {
+      return fstatDescriptor(fd);
+    },
+    async truncate(len?: number): Promise<void> {
+      truncateDescriptor(fd, len);
+    },
+    async sync(): Promise<void> {
+      // No-op - our virtual FS doesn't have disk buffering.
+    },
+    async datasync(): Promise<void> {
+      // No-op - our virtual FS doesn't have disk buffering.
+    },
+    async close(): Promise<void> {
+      closeDescriptor(fd);
+    },
+  });
   const constants: FsConstants = {
     F_OK: 0,
     R_OK: 4,
@@ -253,6 +442,9 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
   };
 
   const promises: FsPromises = {
+    async open(pathLike: unknown, flags?: string | number, mode?: number): Promise<FileHandle> {
+      return createFileHandle(openDescriptor(pathLike, flags, mode));
+    },
     readFile(pathLike: unknown, encodingOrOptions?: string | { encoding?: string | null }): Promise<Buffer | string> {
       return new Promise((resolve, reject) => {
         try {
@@ -485,11 +677,27 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
       return entries;
     },
 
-    statSync(pathLike: unknown, options?: { bigint?: boolean }): Stats {
+    statSync(
+      pathLike: unknown,
+      options?: { bigint?: boolean; throwIfNoEntry?: boolean }
+    ): Stats | undefined {
       const origPath = typeof pathLike === 'string' ? pathLike : String(pathLike);
       const path = resolvePath(pathLike);
       trackCall('statSync', path);
-      const result = vfs.statSync(path);
+      let result: Stats;
+      try {
+        result = vfs.statSync(path);
+      } catch (error) {
+        if (
+          options?.throwIfNoEntry === false &&
+          error instanceof Error &&
+          'code' in error &&
+          error.code === 'ENOENT'
+        ) {
+          return undefined;
+        }
+        throw error;
+      }
       // Debug: Log all statSync calls on _generated paths (show if path was modified)
       if (path.includes('_generated')) {
         const wasRemapped = origPath !== path;
@@ -498,8 +706,25 @@ export function createFsShim(vfs: VirtualFS, getCwd?: () => string): FsShim {
       return options?.bigint ? toBigIntStats(result) : result;
     },
 
-    lstatSync(pathLike: unknown, options?: { bigint?: boolean }): Stats {
-      const result = vfs.lstatSync(resolvePath(pathLike));
+    lstatSync(
+      pathLike: unknown,
+      options?: { bigint?: boolean; throwIfNoEntry?: boolean }
+    ): Stats | undefined {
+      const path = resolvePath(pathLike);
+      let result: Stats;
+      try {
+        result = vfs.lstatSync(path);
+      } catch (error) {
+        if (
+          options?.throwIfNoEntry === false &&
+          error instanceof Error &&
+          'code' in error &&
+          error.code === 'ENOENT'
+        ) {
+          return undefined;
+        }
+        throw error;
+      }
       return options?.bigint ? toBigIntStats(result) : result;
     },
 

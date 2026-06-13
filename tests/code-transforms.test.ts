@@ -1,5 +1,19 @@
 import { describe, it, expect } from 'vitest';
-import { redirectNpmImports } from '../src/frameworks/code-transforms';
+import {
+  redirectNpmImports,
+  transformDynamicImportsToRequire,
+} from '../src/frameworks/code-transforms';
+
+describe('transformDynamicImportsToRequire', () => {
+  it('rewrites expression-level dynamic imports without touching property names', () => {
+    const code = `const load = () => import("./lazy.js");
+const value = obj.import("./not-import.js");`;
+    const result = transformDynamicImportsToRequire(code);
+
+    expect(result).toContain('__dynamicImport("./lazy.js")');
+    expect(result).toContain('obj.import("./not-import.js")');
+  });
+});
 
 describe('redirectNpmImports', () => {
   describe('version resolution from dependencies', () => {

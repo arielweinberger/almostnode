@@ -206,6 +206,10 @@ describe('fs module (Node.js compat)', () => {
       );
     });
 
+    it('should return undefined for missing paths when throwIfNoEntry is false', () => {
+      expect(fs.statSync('/nonexistent', { throwIfNoEntry: false })).toBeUndefined();
+    });
+
     it('should have time properties', () => {
       vfs.writeFileSync('/file.txt', 'content');
       const stats = fs.statSync('/file.txt');
@@ -222,6 +226,10 @@ describe('fs module (Node.js compat)', () => {
       vfs.writeFileSync('/file.txt', 'content');
       const stats = fs.lstatSync('/file.txt');
       assert.strictEqual(stats.isFile(), true);
+    });
+
+    it('should return undefined for missing paths when throwIfNoEntry is false', () => {
+      expect(fs.lstatSync('/nonexistent', { throwIfNoEntry: false })).toBeUndefined();
     });
   });
 
@@ -454,6 +462,25 @@ describe('fs module (Node.js compat)', () => {
       it('should write file', async () => {
         await fs.promises.writeFile('/test.txt', 'hello world');
         assert.strictEqual(vfs.readFileSync('/test.txt', 'utf8'), 'hello world');
+      });
+    });
+
+    describe('open', () => {
+      it('should write through a file handle on close', async () => {
+        const handle = await fs.promises.open('/handle.txt', 'w');
+        await handle.writeFile('from handle');
+        await handle.close();
+
+        assert.strictEqual(vfs.readFileSync('/handle.txt', 'utf8'), 'from handle');
+      });
+
+      it('should read through a file handle', async () => {
+        vfs.writeFileSync('/handle.txt', 'from handle');
+        const handle = await fs.promises.open('/handle.txt', 'r');
+        const content = await handle.readFile('utf8');
+        await handle.close();
+
+        assert.strictEqual(content, 'from handle');
       });
     });
 

@@ -64,10 +64,21 @@ describe('Browser bundle compatibility', () => {
   });
 
   it('should contain the browser-compatible fileURLToPath shim', () => {
-    const content = fs.readFileSync(indexMjs, 'utf-8');
+    // The shim's `function fileURLToPath` may be inlined into index.mjs or
+    // code-split into a chunk that index.mjs statically imports. Search the
+    // entry plus every relative chunk it imports (hashes vary per build).
+    const entry = fs.readFileSync(indexMjs, 'utf-8');
+    const chunkPaths = [
+      ...new Set(
+        [...entry.matchAll(/from\s+['"](\.\/[^'"]+)['"]/g)].map(m => m[1])
+      ),
+    ]
+      .map(rel => path.join(distPath, rel))
+      .filter(p => fs.existsSync(p));
+    const combined = [entry, ...chunkPaths.map(p => fs.readFileSync(p, 'utf-8'))].join('\n');
 
     // The shim defines its own fileURLToPath function
-    expect(content).toContain('function fileURLToPath');
+    expect(combined).toContain('function fileURLToPath');
   });
 
   it('should use dynamic require for Node.js modules in getServiceWorkerContent', () => {

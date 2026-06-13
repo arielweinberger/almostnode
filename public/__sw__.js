@@ -39,13 +39,19 @@ self.addEventListener('message', (event) => {
 
   // When a MessagePort is transferred, it's in event.ports[0], not event.data.port
   if (type === 'init' && event.ports && event.ports[0]) {
-    // Initialize communication channel
-    mainPort = event.ports[0];
-    mainPort.onmessage = handleMainMessage;
-    DEBUG && console.log('[SW] Initialized communication channel with transferred port');
-    // Re-claim clients so that pages opened after SW activation get controlled.
-    // Without this, controllerchange never fires for late-arriving pages.
-    self.clients.claim();
+    const transferredPort = event.ports[0];
+    const finishInit = async () => {
+      // Initialize communication channel
+      mainPort = transferredPort;
+      mainPort.onmessage = handleMainMessage;
+      DEBUG && console.log('[SW] Initialized communication channel with transferred port');
+      // Re-claim clients so pages that registered an already-active worker are
+      // controlled before they navigate an iframe to /__virtual__/...
+      await self.clients.claim();
+      mainPort.postMessage({ type: 'sw-init-complete' });
+    };
+
+    event.waitUntil(finishInit());
   }
 
   if (type === 'server-registered' && data) {

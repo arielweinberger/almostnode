@@ -7,6 +7,16 @@
 import { ResponseData } from '../dev-server';
 import { Buffer } from '../shims/stream';
 
+function createWebStreamModule(): Record<string, unknown> {
+  return {
+    ReadableStream: globalThis.ReadableStream,
+    WritableStream: globalThis.WritableStream,
+    TransformStream: globalThis.TransformStream,
+    ByteLengthQueuingStrategy: globalThis.ByteLengthQueuingStrategy,
+    CountQueuingStrategy: globalThis.CountQueuingStrategy,
+  };
+}
+
 /**
  * Parse cookie header into key-value pairs
  */
@@ -270,20 +280,30 @@ export type StreamingMockResponse = ReturnType<typeof createStreamingMockRespons
 export async function createBuiltinModules(
   createFsShim?: () => unknown | Promise<unknown>
 ): Promise<Record<string, unknown>> {
+  const assertShim = await import('../shims/assert');
   const processShim = await import('../shims/process');
+  const streamShim = await import('../shims/stream');
+  const inspectorShim = await import('../shims/inspector');
   const modules: Record<string, unknown> = {
     https: await import('../shims/https'),
     http: await import('../shims/http'),
+    http2: await import('../shims/http2'),
     path: await import('../shims/path'),
     url: await import('../shims/url'),
     querystring: await import('../shims/querystring'),
     util: await import('../shims/util'),
     events: await import('../shims/events'),
-    stream: await import('../shims/stream'),
+    stream: streamShim,
+    'stream/promises': streamShim.promises,
+    'stream/web': createWebStreamModule(),
     buffer: await import('../shims/buffer'),
     crypto: await import('../shims/crypto'),
+    net: await import('../shims/net'),
+    tls: await import('../shims/tls'),
+    dns: await import('../shims/dns'),
     os: await import('../shims/os'),
-    assert: await import('../shims/assert'),
+    assert: assertShim.default,
+    'assert/strict': assertShim.default.strict,
     module: await import('../shims/module'),
     child_process: await import('../shims/child_process'),
     tty: await import('../shims/tty'),
@@ -293,6 +313,13 @@ export async function createBuiltinModules(
     perf_hooks: await import('../shims/perf_hooks'),
     async_hooks: await import('../shims/async_hooks'),
     worker_threads: await import('../shims/worker_threads'),
+    readline: await import('../shims/readline'),
+    cluster: await import('../shims/cluster'),
+    dgram: await import('../shims/dgram'),
+    domain: await import('../shims/domain'),
+    inspector: inspectorShim,
+    'inspector/promises': inspectorShim,
+    diagnostics_channel: await import('../shims/diagnostics_channel'),
     process: processShim.default,
     lightningcss: await import('../shims/lightningcss'),
   };

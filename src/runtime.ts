@@ -269,6 +269,16 @@ function createTimersModule() {
   };
 }
 
+function createWebStreamModule(): Record<string, unknown> {
+  return {
+    ReadableStream: globalThis.ReadableStream,
+    WritableStream: globalThis.WritableStream,
+    TransformStream: globalThis.TransformStream,
+    ByteLengthQueuingStrategy: globalThis.ByteLengthQueuingStrategy,
+    CountQueuingStrategy: globalThis.CountQueuingStrategy,
+  };
+}
+
 /**
  * Minimal prettier shim - just returns input unchanged
  * This is needed because prettier uses createRequire which conflicts with our runtime
@@ -313,6 +323,7 @@ const builtinModules: Record<string, unknown> = {
   net: netShim,
   events: eventsShim,
   stream: streamShim,
+  'stream/web': createWebStreamModule(),
   buffer: bufferShim,
   url: urlShim,
   querystring: querystringShim,

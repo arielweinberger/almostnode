@@ -78,10 +78,24 @@ describe('npm', () => {
         expect(satisfies('0.9.0', '^1.0.0')).toBe(false);
       });
 
+      it('should match partial caret ranges', () => {
+        expect(satisfies('1.5.4', '^1.0')).toBe(true);
+        expect(satisfies('1.0.0', '^1')).toBe(true);
+        expect(satisfies('2.0.0', '^1.0')).toBe(false);
+        expect(satisfies('0.3.0', '^0.2')).toBe(false);
+      });
+
       it('should match tilde ranges', () => {
         expect(satisfies('1.2.3', '~1.2.0')).toBe(true);
         expect(satisfies('1.2.9', '~1.2.0')).toBe(true);
         expect(satisfies('1.3.0', '~1.2.0')).toBe(false);
+      });
+
+      it('should match partial tilde ranges', () => {
+        expect(satisfies('1.2.3', '~1.2')).toBe(true);
+        expect(satisfies('1.3.0', '~1.2')).toBe(false);
+        expect(satisfies('1.9.9', '~1')).toBe(true);
+        expect(satisfies('2.0.0', '~1')).toBe(false);
       });
 
       it('should match >= ranges', () => {
@@ -93,6 +107,11 @@ describe('npm', () => {
       it('should match > ranges', () => {
         expect(satisfies('1.0.1', '>1.0.0')).toBe(true);
         expect(satisfies('1.0.0', '>1.0.0')).toBe(false);
+      });
+
+      it('should match = ranges', () => {
+        expect(satisfies('0.133.0', '=0.133.0')).toBe(true);
+        expect(satisfies('0.133.1', '=0.133.0')).toBe(false);
       });
 
       it('should match <= ranges', () => {
@@ -135,6 +154,10 @@ describe('npm', () => {
 
       it('should find highest matching version for caret', () => {
         expect(findBestVersion(versions, '^1.0.0')).toBe('1.2.0');
+      });
+
+      it('should find highest matching version for partial caret', () => {
+        expect(findBestVersion(versions, '^1.0')).toBe('1.2.0');
       });
 
       it('should find highest matching version for tilde', () => {
@@ -266,6 +289,69 @@ describe('npm', () => {
         'oxide-wasm32-wasi',
         'portable-helper',
       ]);
+    });
+
+    it('should resolve npm alias dependencies under the alias name', async () => {
+      const manifests = {
+        h3: {
+          name: 'h3',
+          'dist-tags': { latest: '2.0.1-rc.22' },
+          versions: {
+            '2.0.1-rc.20': {
+              name: 'h3',
+              version: '2.0.1-rc.20',
+              dist: {
+                tarball: 'https://registry.npmjs.org/h3/-/h3-2.0.1-rc.20.tgz',
+                shasum: 'h3',
+              },
+              dependencies: {
+                'router-helper': '1.0.0',
+              },
+            },
+          },
+        },
+        'router-helper': {
+          name: 'router-helper',
+          'dist-tags': { latest: '1.0.0' },
+          versions: {
+            '1.0.0': {
+              name: 'router-helper',
+              version: '1.0.0',
+              dist: {
+                tarball:
+                  'https://registry.npmjs.org/router-helper/-/router-helper-1.0.0.tgz',
+                shasum: 'helper',
+              },
+            },
+          },
+        },
+      };
+
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+        const packageName = decodeURIComponent(url.toString().split('/').pop() ?? '');
+        const manifest = Object.entries(manifests).find(
+          ([name]) => name === packageName
+        )?.[1];
+
+        if (manifest) {
+          return new Response(JSON.stringify(manifest), { status: 200 });
+        }
+
+        return new Response('Not found', { status: 404 });
+      });
+
+      const resolved = await resolveFromPackageJson({
+        dependencies: {
+          'h3-v2': 'npm:h3@2.0.1-rc.20',
+        },
+      });
+
+      expect([...resolved.keys()].sort()).toEqual(['h3-v2', 'router-helper']);
+      expect(resolved.get('h3-v2')).toMatchObject({
+        name: 'h3-v2',
+        version: '2.0.1-rc.20',
+        tarballUrl: 'https://registry.npmjs.org/h3/-/h3-2.0.1-rc.20.tgz',
+      });
     });
   });
 
